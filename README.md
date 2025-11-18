@@ -2,7 +2,7 @@
 
 A comprehensive Docker container management tool with auto-start capabilities, smart compose detection, and an interactive menu interface.
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Bash](https://img.shields.io/badge/bash-5.0+-orange.svg)
 
@@ -31,8 +31,11 @@ A comprehensive Docker container management tool with auto-start capabilities, s
 ### Quick Install
 
 ```bash
-# Download and install in one command
-curl -fsSL https://raw.githubusercontent.com/mic3solutiongroup/rfp-scripts/refs/heads/main/docker-ms.sh | sudo bash -s -- --install
+# Download and install in one command (using process substitution)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/mic3solutiongroup/rfp-scripts/refs/heads/main/docker-ms.sh) --install
+
+# Or with your short URL
+sudo bash <(curl -fsSL http://bit.ly/43JqREw) --install
 ```
 
 ### Manual Install
