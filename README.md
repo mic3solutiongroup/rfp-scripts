@@ -35,7 +35,7 @@ A comprehensive Docker container management tool with auto-start capabilities, s
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/mic3solutiongroup/rfp-scripts/refs/heads/main/docker-ms.sh) --install
 
 # Or with your short URL
-sudo bash <(curl -fsSL http://bit.ly/43JqREw) --install
+sudo bash <(curl -fsSL https://bit.ly/49rrUQ0) --install
 ```
 
 ### Manual Install
