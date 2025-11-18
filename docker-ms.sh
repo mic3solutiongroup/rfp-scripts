@@ -277,7 +277,27 @@ self_update() {
 install_script() {
     check_root
     
-    if [[ ! -f "$INSTALL_PATH" ]]; then
+    # Check if script is being piped (curl | bash)
+    if [[ ! -f "$0" ]] || [[ "$0" == "bash" ]] || [[ "$0" == "-bash" ]]; then
+        print_info "Downloading script from GitHub..."
+        local temp_file=$(mktemp)
+        
+        if curl -fsSL "$SCRIPT_URL" -o "$temp_file"; then
+            if [[ -s "$temp_file" ]]; then
+                chmod +x "$temp_file"
+                mv "$temp_file" "$INSTALL_PATH"
+                print_success "Installed to $INSTALL_PATH"
+            else
+                print_error "Downloaded file is empty"
+                rm -f "$temp_file"
+                exit 1
+            fi
+        else
+            print_error "Failed to download script"
+            rm -f "$temp_file"
+            exit 1
+        fi
+    elif [[ ! -f "$INSTALL_PATH" ]] || [[ "$INSTALL_PATH" != "$0" ]]; then
         cp "$0" "$INSTALL_PATH"
         chmod +x "$INSTALL_PATH"
         print_success "Installed to $INSTALL_PATH"
