@@ -2,57 +2,96 @@
 
 set -euo pipefail
 
+# Script configuration
 CONFIG_FILE="/etc/n8s/config.env"
 SCRIPT_PATH="/usr/local/bin/n8s"
 REPO_URL="https://raw.githubusercontent.com/mic3solutiongroup/rfp-scripts/refs/heads/main/n8s.sh"
 
+# Default values
 N8N_DIR="${HOME}/rfp/n8n"
 NGINX_CONF="/etc/nginx/sites-available/n8s-router.conf"
+NGINX_CONF_ENABLED="/etc/nginx/sites-enabled/n8s-router.conf"
 ROUTES_DIR="/etc/nginx/routes-n8s"
 NGINX_PORT_DEFAULT=1440
+SERVER_IP_DEFAULT="localhost"
 
+# Global variables
 declare -gA PORT_MAPPINGS || true
 
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        log_warning "Running as root. Some operations might need user context."
+        return 0
+    fi
+    return 0
+}
+
+# Load or create configuration
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
+        log_info "Loading existing configuration from $CONFIG_FILE"
         source "$CONFIG_FILE"
     else
-        echo "No existing config found. Let's set things up."
+        log_info "No existing config found. Setting up initial configuration..."
+        
+        # Get external IP with fallback
+        if SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 ipinfo.io/ip || echo "$SERVER_IP_DEFAULT"); then
+            log_info "Detected server IP: $SERVER_IP"
+        else
+            SERVER_IP="$SERVER_IP_DEFAULT"
+            log_warning "Could not detect external IP, using: $SERVER_IP"
+        fi
 
         read -p "Enter nginx port to listen on [${NGINX_PORT_DEFAULT}]: " input_port
-        if [[ -n "${input_port:-}" ]]; then
-            NGINX_PORT="$input_port"
-        else
-            NGINX_PORT="$NGINX_PORT_DEFAULT"
-        fi
+        NGINX_PORT="${input_port:-$NGINX_PORT_DEFAULT}"
 
         read -p "Enter n8n directory [${N8N_DIR}]: " input_dir
-        if [[ -n "${input_dir:-}" ]]; then
-            N8N_DIR="$input_dir"
-        fi
+        N8N_DIR="${input_dir:-$N8N_DIR}"
 
-        SERVER_IP=$(curl -s ifconfig.me || echo "localhost")
+        # Initialize other variables
         N8N_INSTALLED=false
         DOCKER_INSTALLED=false
+        NGINX_INSTALLED=false
         declare -gA PORT_MAPPINGS
 
         save_config
     fi
 
+    # Set defaults if not defined
     : "${NGINX_PORT:=$NGINX_PORT_DEFAULT}"
-    : "${SERVER_IP:=$(curl -s ifconfig.me || echo "localhost")}"
-    : "${N8N_DIR:=${HOME}/rfp/n8n}"
-    : "${ROUTES_DIR:=/etc/nginx/routes-n8s}"
-    : "${NGINX_CONF:=/etc/nginx/sites-available/n8s-router.conf}"
+    : "${SERVER_IP:=$(curl -s --max-time 5 ifconfig.me || echo "$SERVER_IP_DEFAULT")}"
+    : "${N8N_DIR:=$N8N_DIR}"
+    : "${ROUTES_DIR:=$ROUTES_DIR}"
+    : "${NGINX_CONF:=$NGINX_CONF}"
+    : "${N8N_INSTALLED:=false}"
+    : "${DOCKER_INSTALLED:=false}"
+    : "${NGINX_INSTALLED:=false}"
 }
 
+# Save configuration
 save_config() {
-    mkdir -p /etc/n8s
+    log_info "Saving configuration to $CONFIG_FILE"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
     {
         echo "NGINX_PORT=$NGINX_PORT"
         echo "SERVER_IP='$SERVER_IP'"
         echo "N8N_INSTALLED=$N8N_INSTALLED"
         echo "DOCKER_INSTALLED=$DOCKER_INSTALLED"
+        echo "NGINX_INSTALLED=$NGINX_INSTALLED"
         echo "N8N_DIR='$N8N_DIR'"
         echo "ROUTES_DIR='$ROUTES_DIR'"
         echo "NGINX_CONF='$NGINX_CONF'"
@@ -66,122 +105,176 @@ save_config() {
             echo "declare -gA PORT_MAPPINGS=()"
         fi
     } > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
 }
 
+# Update script from repository
 update_script() {
-    echo "Updating n8s from repository..."
-    curl -fsSL "$REPO_URL" -o /tmp/n8s_new.sh
-    if [[ $? -eq 0 ]]; then
+    log_info "Updating n8s script from repository..."
+    if curl -fsSL "$REPO_URL" -o /tmp/n8s_new.sh; then
         chmod +x /tmp/n8s_new.sh
-        mv /tmp/n8s_new.sh "$SCRIPT_PATH"
-        echo "Update completed successfully"
-        exit 0
+        if mv /tmp/n8s_new.sh "$SCRIPT_PATH"; then
+            log_success "Update completed successfully"
+            exit 0
+        else
+            log_error "Failed to move updated script to $SCRIPT_PATH"
+            exit 1
+        fi
     else
-        echo "Update failed"
+        log_error "Update failed - could not download from $REPO_URL"
         exit 1
     fi
 }
 
+# Install Docker with comprehensive error handling
 install_docker() {
-    echo "Installing Docker and Docker Compose..."
+    log_info "Starting Docker installation..."
+    
+    if check_docker; then
+        log_success "Docker is already installed and running"
+        DOCKER_INSTALLED=true
+        save_config
+        return 0
+    fi
 
     export DEBIAN_FRONTEND=noninteractive
 
-    apt update
-    apt install -y ca-certificates curl gnupg lsb-release
-
-    mkdir -p /etc/apt/keyrings
-    if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    # Update package list
+    log_info "Updating package lists..."
+    if ! apt update; then
+        log_error "Failed to update package lists"
+        return 1
     fi
 
+    # Install prerequisites
+    log_info "Installing prerequisites..."
+    if ! apt install -y ca-certificates curl gnupg lsb-release; then
+        log_error "Failed to install prerequisites"
+        return 1
+    fi
+
+    # Add Docker's official GPG key
+    log_info "Adding Docker's GPG key..."
+    mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+        log_error "Failed to download Docker GPG key"
+        return 1
+    fi
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Add Docker repository
+    log_info "Adding Docker repository..."
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
       $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    apt update
-
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tee /tmp/docker_install.log
-
-    if grep -q "Errors were encountered while processing" /tmp/docker_install.log 2>/dev/null; then
-        echo "Warning: Some package errors occurred, attempting to fix..."
-        dpkg --configure -a || true
-        apt --fix-broken install -y || true
+    if ! apt update; then
+        log_error "Failed to update package lists with Docker repository"
+        return 1
     fi
 
-    systemctl enable docker 2>/dev/null || true
-    systemctl start docker 2>/dev/null || true
-
-    usermod -aG docker "$USER" 2>/dev/null || true
-
-    if command -v docker &> /dev/null; then
-        if docker compose version &> /dev/null 2>&1; then
-            echo "Docker and Docker Compose installed successfully"
-            DOCKER_INSTALLED=true
-            save_config
-            return 0
-        elif command -v docker-compose &> /dev/null; then
-            echo "Docker installed with docker-compose"
-            DOCKER_INSTALLED=true
-            save_config
-            return 0
-        else
-            echo "Installing standalone docker-compose..."
-            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            chmod +x /usr/local/bin/docker-compose
-            DOCKER_INSTALLED=true
-            save_config
-            return 0
-        fi
-    else
-        echo "Docker installation failed, trying alternative method..."
-        apt install -y docker.io
-        systemctl enable --now docker || true
-
-        if command -v docker &> /dev/null; then
-            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            chmod +x /usr/local/bin/docker-compose
-            DOCKER_INSTALLED=true
-            save_config
-            echo "Docker installed via apt"
-            return 0
-        else
-            echo "Docker installation failed"
+    # Install Docker
+    log_info "Installing Docker packages..."
+    if ! apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+        log_warning "First attempt failed, trying alternative method..."
+        
+        # Try installing docker.io as fallback
+        if ! apt install -y docker.io; then
+            log_error "Docker installation failed completely"
             return 1
         fi
     fi
+
+    # Start and enable Docker service
+    log_info "Starting Docker service..."
+    systemctl enable docker 2>/dev/null || true
+    if ! systemctl start docker; then
+        log_warning "Failed to start Docker service, attempting manual start..."
+        dockerd & 2>/dev/null || true
+        sleep 5
+    fi
+
+    # Add user to docker group
+    log_info "Adding user to docker group..."
+    if ! usermod -aG docker "$USER" 2>/dev/null; then
+        log_warning "Could not add user to docker group. You may need to run Docker commands with sudo."
+    fi
+
+    # Verify installation
+    if check_docker; then
+        log_success "Docker installed successfully"
+        DOCKER_INSTALLED=true
+        save_config
+        return 0
+    else
+        log_error "Docker installation verification failed"
+        return 1
+    fi
 }
 
+# Check Docker status
 check_docker() {
     if ! command -v docker &> /dev/null; then
         return 1
     fi
 
-    if ! systemctl is-active --quiet docker; then
-        systemctl start docker 2>/dev/null || true
+    if ! systemctl is-active --quiet docker 2>/dev/null; then
+        if ! systemctl start docker 2>/dev/null; then
+            return 1
+        fi
         sleep 2
     fi
 
-    if ! docker compose version &> /dev/null 2>&1 && ! command -v docker-compose &> /dev/null; then
+    # Test Docker functionality
+    if ! docker info &> /dev/null; then
         return 1
     fi
 
     return 0
 }
 
-patch_nginx_conf() {
-    return 0
+# Install and configure nginx
+install_nginx() {
+    log_info "Starting nginx installation..."
+    
+    if command -v nginx &> /dev/null; then
+        log_success "nginx is already installed"
+        NGINX_INSTALLED=true
+    else
+        log_info "Installing nginx..."
+        if ! apt update || ! apt install -y nginx; then
+            log_error "Failed to install nginx"
+            return 1
+        fi
+        NGINX_INSTALLED=true
+        systemctl enable nginx
+    fi
+
+    # Ensure nginx is running
+    if ! systemctl is-active --quiet nginx; then
+        log_info "Starting nginx service..."
+        if ! systemctl start nginx; then
+            log_error "Failed to start nginx"
+            return 1
+        fi
+    fi
+
+    # Generate nginx configuration
+    generate_nginx_config
 }
 
+# Generate nginx configuration
 generate_nginx_config() {
+    log_info "Generating nginx configuration..."
+    
     mkdir -p "$ROUTES_DIR"
 
+    # Remove old conflicting configurations
     rm -f /etc/nginx/sites-available/8443-router.conf 2>/dev/null || true
     rm -f /etc/nginx/sites-enabled/8443-router.conf 2>/dev/null || true
-    rmdir /etc/nginx/routes-8443 2>/dev/null || true
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-    patch_nginx_conf
-
+    # Create main nginx configuration
     cat > "$NGINX_CONF" << 'NGXEOF'
 server {
     listen NGINX_PORT_PLACEHOLDER default_server;
@@ -189,188 +282,300 @@ server {
     server_name _;
     client_max_body_size 100M;
 
-    location = / {
-        return 200 'nginx router is alive\n';
+    # Health check endpoint
+    location = /health {
+        return 200 'healthy\n';
         add_header Content-Type text/plain;
     }
 
+    # Root endpoint
+    location = / {
+        return 200 'n8s router is running on port NGINX_PORT_PLACEHOLDER\n';
+        add_header Content-Type text/plain;
+    }
+
+    # Include all route configurations
     include ROUTES_DIR_PLACEHOLDER/*.conf;
 }
 NGXEOF
 
+    # Replace placeholders
     sed -i "s/NGINX_PORT_PLACEHOLDER/$NGINX_PORT/g" "$NGINX_CONF"
     sed -i "s|ROUTES_DIR_PLACEHOLDER|$ROUTES_DIR|g" "$NGINX_CONF"
 
-    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/n8s-router.conf
-    rm -f /etc/nginx/sites-enabled/default || true
+    # Enable site
+    ln -sf "$NGINX_CONF" "$NGINX_CONF_ENABLED"
 
-    nginx -t && systemctl reload nginx
-}
-
-install_nginx() {
-    if ! command -v nginx &> /dev/null; then
-        echo "Installing nginx..."
-        apt update
-        apt install -y nginx
-        systemctl enable --now nginx
+    # Test and reload nginx
+    if nginx -t; then
+        systemctl reload nginx
+        log_success "nginx configuration updated successfully"
+    else
+        log_error "nginx configuration test failed"
+        return 1
     fi
-
-    generate_nginx_config
 }
 
+# Write n8n route configuration (interactive)
 write_n8n_route() {
     mkdir -p "$ROUTES_DIR"
-    cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
-location /n8n/ {
-    proxy_pass http://127.0.0.1:5678/n8n/;
+
+    echo ""
+    echo "=== n8n Access Configuration ==="
+    echo "How do you want to access n8n?"
+    echo "1) Path-based (e.g., http://yourserver:${NGINX_PORT}/n8n/)"
+    echo "2) Port-based (e.g., http://yourserver:5678 - direct access)"
+    echo ""
+    read -p "Select option (1 or 2) [1]: " access_type
+    access_type="${access_type:-1}"
+
+    if [[ "$access_type" == "1" ]]; then
+        # Path-based access
+        read -p "Enter nginx path for n8n [/n8n/]: " n8n_path
+        n8n_path="${n8n_path:-/n8n/}"
+
+        # Ensure path starts and ends with /
+        [[ ! "$n8n_path" =~ ^/ ]] && n8n_path="/$n8n_path"
+        [[ ! "$n8n_path" =~ /$ ]] && n8n_path="$n8n_path/"
+
+        read -p "Enter n8n internal port [5678]: " n8n_port
+        n8n_port="${n8n_port:-5678}"
+
+        read -p "Does n8n use a base path? (y/n) [y]: " has_base_path
+        has_base_path="${has_base_path:-y}"
+
+        if [[ "$has_base_path" == "y" ]]; then
+            proxy_target="http://127.0.0.1:${n8n_port}/"
+        else
+            proxy_target="http://127.0.0.1:${n8n_port}"
+        fi
+
+        # Create path-based configuration
+        cat > "$ROUTES_DIR/n8n.conf" << N8NEOF
+location ${n8n_path} {
+    proxy_pass ${proxy_target};
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $http_host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header Origin "$scheme://$http_host";
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$host;
+    proxy_set_header X-Forwarded-Port \$server_port;
+
     proxy_buffering off;
     proxy_request_buffering off;
-}
-location = /n8n {
-    return 301 /n8n/;
-}
-N8NEOF
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
 }
 
+location = ${n8n_path%/} {
+    return 301 ${n8n_path};
+}
+N8NEOF
+
+        PORT_MAPPINGS["$n8n_path"]="$n8n_port"
+        log_success "Path-based n8n route configured: http://${SERVER_IP}:${NGINX_PORT}${n8n_path} -> localhost:${n8n_port}"
+
+    else
+        # Port-based access (no nginx proxy)
+        read -p "Enter n8n port [5678]: " n8n_port
+        n8n_port="${n8n_port:-5678}"
+
+        log_info "Port-based access selected. n8n will be directly accessible at:"
+        log_info "  http://${SERVER_IP}:${n8n_port}"
+        log_warning "Note: Ensure Docker publishes port ${n8n_port} (not just 127.0.0.1:${n8n_port})"
+
+        # Remove any existing n8n nginx config
+        rm -f "$ROUTES_DIR/n8n.conf"
+        log_success "Port-based n8n access configured"
+    fi
+}
+
+# Install n8n
 install_n8n() {
+    log_info "Starting n8n installation..."
+    
     if ! check_docker; then
-        echo "Docker not installed or not running. Please install Docker first (Option 8)"
+        log_error "Docker not available. Please install Docker first."
         return 1
     fi
 
-    echo "Setting up n8n..."
-
-    if [[ ! -d "$N8N_DIR" ]]; then
-        echo "Creating directory: $N8N_DIR"
-        mkdir -p "$N8N_DIR"
-    else
-        echo "Directory exists: $N8N_DIR"
+    # Ensure nginx is installed and configured
+    if ! install_nginx; then
+        log_error "nginx installation failed"
+        return 1
     fi
 
+    # Create n8n directory
+    log_info "Setting up n8n in: $N8N_DIR"
+    mkdir -p "$N8N_DIR"
+
+    # Check for existing installation
     if [[ -f "$N8N_DIR/docker-compose.yml" ]]; then
-        read -p "docker-compose.yml exists in $N8N_DIR. Overwrite? (y/n): " overwrite
+        read -p "n8n docker-compose.yml exists. Overwrite? (y/n): " overwrite
         if [[ "$overwrite" != "y" ]]; then
-            echo "Skipping docker-compose.yml creation"
+            log_warning "Skipping n8n installation"
             return 1
         fi
     fi
 
-    docker volume create n8n_data 2>/dev/null || true
+    # Create docker volume
+    log_info "Creating Docker volume for n8n..."
+    docker volume create n8n_data 2>/dev/null || log_warning "Volume might already exist"
 
+    # Create docker-compose file
+    log_info "Creating docker-compose configuration..."
     cat > "$N8N_DIR/docker-compose.yml" << DCEOF
+version: '3.8'
+
 services:
   n8n:
     image: docker.io/n8nio/n8n:latest
     container_name: n8n
-    restart: always
-    network_mode: host
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"
     environment:
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_HOST=0.0.0.0
-      - N8N_PATH=/n8n/
-      - N8N_EDITOR_BASE_URL=http://$SERVER_IP:$NGINX_PORT/n8n/
-      - WEBHOOK_URL=http://$SERVER_IP:$NGINX_PORT/
-      - N8N_ALLOWED_ORIGINS=*
-      - N8N_SECURE_COOKIE=false
+      - N8N_BASE_URL=/n8n/
+      - N8N_EDITOR_BASE_URL=http://${SERVER_IP}:${NGINX_PORT}/n8n/
+      - WEBHOOK_URL=http://${SERVER_IP}:${NGINX_PORT}/
+      - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_PUSH_BACKEND=websocket
-      - N8N_PROXY_HOPS=1
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-      - DB_SQLITE_POOL_SIZE=3
+      - N8N_SECURE_COOKIE=false
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=UTC
     volumes:
       - n8n_data:/home/node/.n8n
+    networks:
+      - n8n_network
+
 volumes:
   n8n_data:
     external: true
+
+networks:
+  n8n_network:
+    driver: bridge
 DCEOF
 
-    echo "Starting n8n container..."
+    # Start n8n
+    log_info "Starting n8n container..."
     cd "$N8N_DIR"
-
-    if docker compose version &> /dev/null 2>&1; then
+    
+    if docker compose version &> /dev/null; then
         docker compose up -d
-    else
+    elif command -v docker-compose &> /dev/null; then
         docker-compose up -d
+    else
+        log_error "Docker Compose not available"
+        return 1
     fi
 
+    # Wait for n8n to start
+    log_info "Waiting for n8n to start..."
+    for i in {1..30}; do
+        if curl -s http://127.0.0.1:5678/healthz > /dev/null; then
+            break
+        fi
+        sleep 2
+    done
+
+    # Configure nginx route
     write_n8n_route
 
-    nginx -t && systemctl reload nginx
+    # Reload nginx
+    if nginx -t && systemctl reload nginx; then
+        log_success "nginx reloaded with n8n configuration"
+    else
+        log_error "Failed to reload nginx"
+    fi
 
+    # Update configuration
     N8N_INSTALLED=true
     PORT_MAPPINGS['/n8n/']=5678
     save_config
 
+    log_success "n8n installation completed!"
     echo ""
-    echo "========================================="
-    echo "n8n installed successfully!"
-    echo "URL: http://$SERVER_IP:$NGINX_PORT/n8n/"
-    echo "Config: $N8N_DIR/docker-compose.yml"
-    echo "========================================="
+    echo "================================================"
+    echo "n8n is now accessible at:"
+    echo "URL: http://${SERVER_IP}:${NGINX_PORT}/n8n/"
+    echo "Local: http://127.0.0.1:5678/"
+    echo "Directory: $N8N_DIR"
+    echo "================================================"
     echo ""
 }
 
+# Reinstall n8n
 reinstall_n8n() {
     if ! check_docker; then
-        echo "Docker not installed or not running. Use option 8 first."
+        log_error "Docker not available"
         return 1
     fi
 
     if [[ "${N8N_INSTALLED:-false}" != "true" || ! -f "$N8N_DIR/docker-compose.yml" ]]; then
-        echo "n8n does not appear to be installed via this script."
-        echo "Running a fresh install instead..."
-        install_nginx
+        log_warning "n8n not installed via this script. Performing fresh install..."
         install_n8n
         return
     fi
 
-    echo "This will stop and recreate the n8n container."
+    log_warning "This will stop and recreate the n8n container."
     read -p "Continue? (y/n): " confirm
-    [[ "$confirm" != "y" ]] && echo "Reinstall cancelled." && return
+    [[ "$confirm" != "y" ]] && log_info "Reinstall cancelled." && return
 
     cd "$N8N_DIR" || {
-        echo "Cannot cd into $N8N_DIR, aborting."
+        log_error "Cannot access n8n directory: $N8N_DIR"
         return 1
     }
 
-    echo "Stopping existing n8n container..."
-    if docker compose version &> /dev/null 2>&1; then
+    # Stop and remove existing container
+    log_info "Stopping existing n8n container..."
+    if docker compose version &> /dev/null; then
         docker compose down
     else
         docker-compose down
     fi
 
-    read -p "Remove existing docker volume 'n8n_data'? This will wipe all n8n data. (y/n): " wipe
+    # Optionally remove volume
+    read -p "Remove n8n data volume? This will delete all workflows! (y/n): " wipe
     if [[ "$wipe" == "y" ]]; then
-        echo "Removing volume n8n_data..."
-        docker volume rm n8n_data 2>/dev/null || true
+        log_warning "Removing n8n_data volume..."
+        docker volume rm n8n_data 2>/dev/null || log_warning "Volume might not exist"
     fi
 
     N8N_INSTALLED=false
     save_config
 
-    echo "Reinstalling n8n..."
+    # Reinstall
     install_n8n
 }
 
+# Add custom route
 add_route() {
     read -p "Enter nginx path (e.g., /api/): " path
     read -p "Enter internal port: " port
     read -p "Route name (alphanumeric): " name
 
+    # Validate input
+    [[ -z "$path" || -z "$port" || -z "$name" ]] && {
+        log_error "All fields are required"
+        return 1
+    }
+
     [[ ! "$path" =~ ^/ ]] && path="/$path"
     [[ ! "$path" =~ /$ ]] && path="$path/"
 
+    # Sanitize name
+    name=$(echo "$name" | tr -cd '[:alnum:]-_')
+
     mkdir -p "$ROUTES_DIR"
 
+    # Create route configuration
     cat > "$ROUTES_DIR/${name}.conf" << RTEOF
 location $path {
     proxy_pass http://127.0.0.1:$port/;
@@ -381,171 +586,572 @@ location $path {
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_buffering off;
 }
 RTEOF
 
-    nginx -t && systemctl reload nginx
-
-    PORT_MAPPINGS["$path"]="$port"
-    save_config
-
-    echo "Route added: http://$SERVER_IP:$NGINX_PORT$path -> localhost:$port"
+    # Test and reload nginx
+    if nginx -t && systemctl reload nginx; then
+        PORT_MAPPINGS["$path"]="$port"
+        save_config
+        log_success "Route added: http://$SERVER_IP:$NGINX_PORT$path -> localhost:$port"
+    else
+        rm -f "$ROUTES_DIR/${name}.conf"
+        log_error "Failed to add route - nginx configuration test failed"
+        return 1
+    fi
 }
 
+# List all routes
 list_routes() {
-    echo "=== Current Routes ==="
-    echo "Nginx Port : $NGINX_PORT"
-    echo "Server IP  : $SERVER_IP"
-    echo "Docker     : $DOCKER_INSTALLED"
-    echo "n8n        : $N8N_INSTALLED"
-    echo "n8n Dir    : $N8N_DIR"
-    echo "Routes Dir : $ROUTES_DIR"
+    echo "=== Current Configuration ==="
+    echo "Nginx Port    : $NGINX_PORT"
+    echo "Server IP     : $SERVER_IP"
+    echo "Docker Status : $([ "$DOCKER_INSTALLED" = "true" ] && echo "Installed" || echo "Not Installed")"
+    echo "nginx Status  : $([ "$NGINX_INSTALLED" = "true" ] && echo "Installed" || echo "Not Installed")"
+    echo "n8n Status    : $([ "$N8N_INSTALLED" = "true" ] && echo "Installed" || echo "Not Installed")"
+    echo "n8n Directory : $N8N_DIR"
+    echo "Routes Dir    : $ROUTES_DIR"
     echo ""
+    
     if [[ ${#PORT_MAPPINGS[@]} -eq 0 ]]; then
         echo "No routes configured"
     else
+        echo "=== Configured Routes ==="
         for path in "${!PORT_MAPPINGS[@]}"; do
             echo "http://$SERVER_IP:$NGINX_PORT$path -> localhost:${PORT_MAPPINGS[$path]}"
         done
     fi
 }
 
+# Remove route
 remove_route() {
     list_routes
     echo ""
     read -p "Enter route name to remove (conf name without .conf): " name
 
     if [[ -f "$ROUTES_DIR/${name}.conf" ]]; then
+        # Find the path from the configuration file to remove from PORT_MAPPINGS
+        path=$(grep -o 'location[[:space:]]*[^[:space:]]*' "$ROUTES_DIR/${name}.conf" | awk '{print $2}')
+        
         rm -f "$ROUTES_DIR/${name}.conf"
-        nginx -t && systemctl reload nginx
-
-        for path in "${!PORT_MAPPINGS[@]}"; do
-            if [[ "$path" == *"$name"* ]]; then
-                unset 'PORT_MAPPINGS[$path]'
-                break
-            fi
-        done
+        
+        # Remove from PORT_MAPPINGS
+        if [[ -n "$path" ]]; then
+            unset "PORT_MAPPINGS[$path]"
+        fi
 
         save_config
-        echo "Route removed"
+
+        if nginx -t && systemctl reload nginx; then
+            log_success "Route '$name' removed successfully"
+        else
+            log_error "Route removed but nginx reload failed"
+        fi
     else
-        echo "Route not found"
+        log_error "Route '$name' not found"
     fi
 }
 
+# Change settings
 change_settings() {
-    read -p "Enter new nginx port [$NGINX_PORT]: " new_port
-    [[ -n "${new_port:-}" ]] && NGINX_PORT="$new_port"
+    echo "=== Current Settings ==="
+    echo "1. Nginx Port: $NGINX_PORT"
+    echo "2. Server IP: $SERVER_IP"
+    echo "3. n8n Directory: $N8N_DIR"
+    echo ""
 
-    read -p "Enter server IP [$SERVER_IP]: " new_ip
-    [[ -n "${new_ip:-}" ]] && SERVER_IP="$new_ip"
+    read -p "Enter setting number to change (1-3) or 'c' to cancel: " choice
 
-    read -p "Enter n8n directory [$N8N_DIR]: " new_dir
-    [[ -n "${new_dir:-}" ]] && N8N_DIR="$new_dir"
+    case $choice in
+        1)
+            read -p "Enter new nginx port [$NGINX_PORT]: " new_port
+            [[ -n "${new_port:-}" ]] && NGINX_PORT="$new_port"
+            ;;
+        2)
+            read -p "Enter server IP [$SERVER_IP]: " new_ip
+            [[ -n "${new_ip:-}" ]] && SERVER_IP="$new_ip"
+            ;;
+        3)
+            read -p "Enter n8n directory [$N8N_DIR]: " new_dir
+            [[ -n "${new_dir:-}" ]] && N8N_DIR="$new_dir"
+            ;;
+        c|C)
+            log_info "Settings change cancelled"
+            return
+            ;;
+        *)
+            log_error "Invalid choice"
+            return 1
+            ;;
+    esac
 
     save_config
 
-    echo "Regenerating nginx config for new port..."
+    # Regenerate nginx config
+    log_info "Updating nginx configuration..."
     generate_nginx_config
 
+    # Update n8n if installed
     if [[ "${N8N_INSTALLED:-false}" == "true" && -f "$N8N_DIR/docker-compose.yml" ]]; then
+        log_info "Updating n8n configuration..."
         cd "$N8N_DIR"
+        
+        # Update docker-compose file with new settings
         sed -i "s|N8N_EDITOR_BASE_URL=.*|N8N_EDITOR_BASE_URL=http://$SERVER_IP:$NGINX_PORT/n8n/|" docker-compose.yml
         sed -i "s|WEBHOOK_URL=.*|WEBHOOK_URL=http://$SERVER_IP:$NGINX_PORT/|" docker-compose.yml
 
-        if docker compose version &> /dev/null 2>&1; then
-            docker compose down
-            docker compose up -d
+        # Restart n8n
+        if docker compose version &> /dev/null; then
+            docker compose down && docker compose up -d
         else
-            docker-compose down
-            docker-compose up -d
+            docker-compose down && docker-compose up -d
         fi
+
+        # Update nginx route
+        write_n8n_route
     fi
 
+    # Reload nginx
     nginx -t && systemctl reload nginx
-    echo "Settings updated"
+    log_success "Settings updated successfully"
 }
 
+# Refresh all configurations
 refresh_config() {
-    echo "Refreshing nginx and n8n configs using current settings..."
+    log_info "Refreshing all configurations..."
+    
     generate_nginx_config
-    write_n8n_route
-
-    nginx -t && systemctl reload nginx
-
-    if [[ "${N8N_INSTALLED:-false}" == "true" && -f "$N8N_DIR/docker-compose.yml" ]]; then
-        echo "Restarting n8n container to apply any config changes..."
+    
+    if [[ "${N8N_INSTALLED:-false}" == "true" ]]; then
+        write_n8n_route
+        log_info "Restarting n8n container..."
         cd "$N8N_DIR"
-        if docker compose version &> /dev/null 2>&1; then
-            docker compose down
-            docker compose up -d
+        if docker compose version &> /dev/null; then
+            docker compose restart
         else
-            docker-compose down
-            docker-compose up -d
+            docker-compose restart
         fi
     fi
 
-    echo "Config refresh complete."
+    nginx -t && systemctl reload nginx
+    log_success "All configurations refreshed successfully"
 }
 
+# Docker status check
 docker_status() {
     echo "=== Docker Status ==="
     if check_docker; then
-        echo "Docker: Installed and Running"
+        echo -e "${GREEN}✓ Docker: Installed and Running${NC}"
         docker --version
-        docker compose version 2>/dev/null || docker-compose --version 2>/dev/null
+        docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo "Docker Compose: Not found"
         echo ""
-        echo "Running containers:"
-        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+        echo "=== Running Containers ==="
+        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || echo "No containers running"
         echo ""
-        echo "Docker volumes (n8n-related):"
-        docker volume ls | grep n8n || echo "No n8n volumes"
+
+        echo "=== All Containers (including stopped) ==="
+        docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" || echo "No containers found"
+        echo ""
+
+        echo "=== n8n Volumes ==="
+        docker volume ls | grep n8n || echo "No n8n volumes found"
+        echo ""
+
+        echo "=== All Volumes ==="
+        docker volume ls --format "table {{.Name}}\t{{.Driver}}" || echo "No volumes found"
     else
-        echo "Docker: Not installed or not running"
+        echo -e "${RED}✗ Docker: Not installed or not running${NC}"
     fi
 }
 
+# List all Docker containers
+list_containers() {
+    if ! check_docker; then
+        log_error "Docker not available"
+        return 1
+    fi
+
+    echo "=== All Docker Containers ==="
+    docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
+}
+
+# Stop and remove n8n container
+remove_n8n_container() {
+    if ! check_docker; then
+        log_error "Docker not available"
+        return 1
+    fi
+
+    if ! docker ps -a --format "{{.Names}}" | grep -q "^n8n$"; then
+        log_warning "n8n container not found"
+        return 1
+    fi
+
+    log_warning "This will stop and remove the n8n container."
+    read -p "Continue? (y/n): " confirm
+    [[ "$confirm" != "y" ]] && log_info "Operation cancelled." && return
+
+    log_info "Stopping n8n container..."
+    docker stop n8n 2>/dev/null || true
+
+    log_info "Removing n8n container..."
+    if docker rm n8n; then
+        log_success "n8n container removed"
+    else
+        log_error "Failed to remove n8n container"
+        return 1
+    fi
+}
+
+# Remove n8n volumes
+remove_n8n_volumes() {
+    if ! check_docker; then
+        log_error "Docker not available"
+        return 1
+    fi
+
+    echo "=== n8n Volumes ==="
+    docker volume ls | grep n8n || {
+        log_warning "No n8n volumes found"
+        return 1
+    }
+
+    echo ""
+    log_warning "This will DELETE ALL n8n data including workflows, credentials, and settings!"
+    read -p "Are you sure you want to remove n8n volumes? (yes/no): " confirm
+    [[ "$confirm" != "yes" ]] && log_info "Operation cancelled." && return
+
+    log_info "Removing n8n volumes..."
+
+    # Stop container first if running
+    docker stop n8n 2>/dev/null || true
+    docker rm n8n 2>/dev/null || true
+
+    # Remove volumes
+    local removed=0
+    for volume in $(docker volume ls -q | grep n8n); do
+        if docker volume rm "$volume"; then
+            log_success "Removed volume: $volume"
+            ((removed++))
+        else
+            log_error "Failed to remove volume: $volume"
+        fi
+    done
+
+    if [[ $removed -gt 0 ]]; then
+        log_success "Removed $removed n8n volume(s)"
+    else
+        log_warning "No volumes were removed"
+    fi
+}
+
+# Clean all Docker resources
+docker_cleanup() {
+    if ! check_docker; then
+        log_error "Docker not available"
+        return 1
+    fi
+
+    echo "=== Docker Cleanup Options ==="
+    echo "1) Remove stopped containers only"
+    echo "2) Remove unused volumes"
+    echo "3) Remove unused images"
+    echo "4) Full cleanup (stopped containers + unused volumes + images)"
+    echo "5) Remove ALL containers and volumes (DANGEROUS)"
+    echo "6) Cancel"
+    echo ""
+    read -p "Select option (1-6): " cleanup_choice
+
+    case $cleanup_choice in
+        1)
+            log_info "Removing stopped containers..."
+            docker container prune -f && log_success "Stopped containers removed"
+            ;;
+        2)
+            log_info "Removing unused volumes..."
+            docker volume prune -f && log_success "Unused volumes removed"
+            ;;
+        3)
+            log_info "Removing unused images..."
+            docker image prune -a -f && log_success "Unused images removed"
+            ;;
+        4)
+            log_warning "This will remove all stopped containers, unused volumes, and images"
+            read -p "Continue? (y/n): " confirm
+            if [[ "$confirm" == "y" ]]; then
+                docker system prune -a --volumes -f && log_success "Docker cleanup completed"
+            fi
+            ;;
+        5)
+            log_error "WARNING: This will remove ALL containers and volumes!"
+            read -p "Type 'DELETE EVERYTHING' to confirm: " confirm
+            if [[ "$confirm" == "DELETE EVERYTHING" ]]; then
+                docker stop $(docker ps -aq) 2>/dev/null || true
+                docker rm $(docker ps -aq) 2>/dev/null || true
+                docker volume rm $(docker volume ls -q) 2>/dev/null || true
+                log_success "All containers and volumes removed"
+            else
+                log_info "Operation cancelled"
+            fi
+            ;;
+        6)
+            log_info "Operation cancelled"
+            ;;
+        *)
+            log_error "Invalid option"
+            ;;
+    esac
+}
+
+# Manage n8n container
+manage_n8n_container() {
+    if ! check_docker; then
+        log_error "Docker not available"
+        return 1
+    fi
+
+    echo "=== n8n Container Management ==="
+
+    # Check if container exists
+    if docker ps -a --format "{{.Names}}" | grep -q "^n8n$"; then
+        local status=$(docker inspect -f '{{.State.Status}}' n8n)
+        echo "n8n Container Status: $status"
+        echo ""
+
+        echo "1) Start n8n container"
+        echo "2) Stop n8n container"
+        echo "3) Restart n8n container"
+        echo "4) View n8n logs (live)"
+        echo "5) View n8n logs (last 50 lines)"
+        echo "6) Remove n8n container"
+        echo "7) Remove n8n container AND volumes"
+        echo "8) Shell access to n8n container"
+        echo "9) Back to menu"
+        echo ""
+        read -p "Select option (1-9): " n8n_choice
+
+        case $n8n_choice in
+            1)
+                docker start n8n && log_success "n8n container started"
+                ;;
+            2)
+                docker stop n8n && log_success "n8n container stopped"
+                ;;
+            3)
+                docker restart n8n && log_success "n8n container restarted"
+                ;;
+            4)
+                log_info "Showing live logs (Ctrl+C to exit)..."
+                docker logs -f n8n
+                ;;
+            5)
+                docker logs --tail 50 n8n
+                ;;
+            6)
+                remove_n8n_container
+                ;;
+            7)
+                remove_n8n_container
+                remove_n8n_volumes
+                ;;
+            8)
+                log_info "Entering n8n container shell..."
+                docker exec -it n8n /bin/sh || docker exec -it n8n /bin/bash
+                ;;
+            9)
+                return
+                ;;
+            *)
+                log_error "Invalid option"
+                ;;
+        esac
+    else
+        log_warning "n8n container not found"
+        echo ""
+        echo "Would you like to install n8n?"
+        read -p "(y/n): " install_choice
+        [[ "$install_choice" == "y" ]] && install_n8n
+    fi
+}
+
+# System status overview
+system_status() {
+    echo "=== System Status Overview ==="
+    
+    # Docker status
+    if check_docker; then
+        echo -e "Docker: ${GREEN}✓ Running${NC}"
+    else
+        echo -e "Docker: ${RED}✗ Not Running${NC}"
+    fi
+    
+    # nginx status
+    if systemctl is-active --quiet nginx; then
+        echo -e "nginx:  ${GREEN}✓ Running${NC}"
+    else
+        echo -e "nginx:  ${RED}✗ Not Running${NC}"
+    fi
+    
+    # n8n status
+    if docker ps --format "table {{.Names}}" | grep -q n8n; then
+        echo -e "n8n:    ${GREEN}✓ Running${NC}"
+    elif [[ "$N8N_INSTALLED" == "true" ]]; then
+        echo -e "n8n:    ${YELLOW}⚠ Installed but not running${NC}"
+    else
+        echo -e "n8n:    ${RED}✗ Not Installed${NC}"
+    fi
+    
+    echo ""
+    echo "=== Access Information ==="
+    echo "Nginx Router: http://$SERVER_IP:$NGINX_PORT"
+    if [[ "$N8N_INSTALLED" == "true" ]]; then
+        echo "n8n Interface: http://$SERVER_IP:$NGINX_PORT/n8n/"
+    fi
+}
+
+# Main menu
 menu() {
     while true; do
         clear
-        echo "╔════════════════════════════════════╗"
-        echo "║      N8S - Nginx Manager v3.4     ║"
-        echo "╚════════════════════════════════════╝"
+        echo -e "${BLUE}"
+        echo "╔══════════════════════════════════════════╗"
+        echo "║           N8S - Manager v4.0            ║"
+        echo "║    nginx + Docker + n8n Super Script    ║"
+        echo "╚══════════════════════════════════════════╝"
+        echo -e "${NC}"
         echo ""
-        echo "  1) Install n8n"
-        echo "  2) Add Route"
-        echo "  3) List Routes"
-        echo "  4) Remove Route"
-        echo "  5) Change Settings (port/IP/dir)"
-        echo "  6) Update Script"
-        echo "  7) Docker Status"
-        echo "  8) Install Docker"
-        echo "  9) Exit"
-        echo " 10) Reinstall n8n"
-        echo " 11) Refresh Config (nginx + n8n)"
+        
+        # Quick status
+        system_status
+        
+        echo ""
+        echo "╔══════════════════════════════════════════╗"
+        echo "║               Main Menu                  ║"
+        echo "╚══════════════════════════════════════════╝"
+        echo ""
+        echo "  === Installation & Setup ==="
+        echo "  1)  Install n8n (Full Setup)"
+        echo "  2)  Install Docker Only"
+        echo "  3)  Install nginx Only"
+        echo "  4)  Reinstall n8n"
+        echo ""
+        echo "  === Configuration ==="
+        echo "  5)  Add Custom Route"
+        echo "  6)  List Routes & Status"
+        echo "  7)  Remove Route"
+        echo "  8)  Change Settings"
+        echo "  9)  Refresh All Configs"
+        echo ""
+        echo "  === Docker Management ==="
+        echo "  10) Docker Status & Info"
+        echo "  11) List All Containers"
+        echo "  12) Manage n8n Container"
+        echo "  13) Remove n8n Volumes"
+        echo "  14) Docker Cleanup"
+        echo ""
+        echo "  === System ==="
+        echo "  15) System Status"
+        echo "  16) Update Script"
+        echo "  17) Exit"
         echo ""
         read -p "Select option: " choice
 
         case $choice in
-            1) install_nginx && install_n8n; read -p "Press enter..." ;;
-            2) add_route; read -p "Press enter..." ;;
-            3) list_routes; read -p "Press enter..." ;;
-            4) remove_route; read -p "Press enter..." ;;
-            5) change_settings; read -p "Press enter..." ;;
-            6) update_script ;;
-            7) docker_status; read -p "Press enter..." ;;
-            8) install_docker; read -p "Press enter..." ;;
-            9) exit 0 ;;
-            10) reinstall_n8n; read -p "Press enter..." ;;
-            11) refresh_config; read -p "Press enter..." ;;
-            *) echo "Invalid option"; sleep 1 ;;
+            1) install_n8n; read -p "Press enter to continue... " ;;
+            2) install_docker; read -p "Press enter to continue... " ;;
+            3) install_nginx; read -p "Press enter to continue... " ;;
+            4) reinstall_n8n; read -p "Press enter to continue... " ;;
+            5) add_route; read -p "Press enter to continue... " ;;
+            6) list_routes; read -p "Press enter to continue... " ;;
+            7) remove_route; read -p "Press enter to continue... " ;;
+            8) change_settings; read -p "Press enter to continue... " ;;
+            9) refresh_config; read -p "Press enter to continue... " ;;
+            10) docker_status; read -p "Press enter to continue... " ;;
+            11) list_containers; read -p "Press enter to continue... " ;;
+            12) manage_n8n_container; read -p "Press enter to continue... " ;;
+            13) remove_n8n_volumes; read -p "Press enter to continue... " ;;
+            14) docker_cleanup; read -p "Press enter to continue... " ;;
+            15) system_status; read -p "Press enter to continue... " ;;
+            16) update_script ;;
+            17) log_info "Goodbye!"; exit 0 ;;
+            *) log_error "Invalid option"; sleep 1 ;;
         esac
     done
 }
 
-if [[ "${1:-}" == "-update" || "${1:-}" == "update" ]]; then
-    update_script
-fi
+# Handle command line arguments
+case "${1:-}" in
+    "-update"|"update")
+        update_script
+        ;;
+    "-status"|"status")
+        load_config
+        system_status
+        ;;
+    "-install-docker")
+        install_docker
+        ;;
+    "-install-nginx")
+        install_nginx
+        ;;
+    "-install-n8n")
+        load_config
+        install_n8n
+        ;;
+    "-list-containers")
+        load_config
+        list_containers
+        ;;
+    "-manage-n8n")
+        load_config
+        manage_n8n_container
+        ;;
+    "-docker-cleanup")
+        load_config
+        docker_cleanup
+        ;;
+    "-docker-status")
+        load_config
+        docker_status
+        ;;
+    "-help"|"help"|"-h")
+        echo "N8S Manager - nginx + Docker + n8n Super Script"
+        echo ""
+        echo "Usage: $0 [option]"
+        echo ""
+        echo "Installation Options:"
+        echo "  -install-docker        Install Docker only"
+        echo "  -install-nginx         Install nginx only"
+        echo "  -install-n8n           Install n8n with full setup"
+        echo ""
+        echo "Status & Information:"
+        echo "  status, -status        Show system status overview"
+        echo "  -docker-status         Show detailed Docker status"
+        echo "  -list-containers       List all Docker containers"
+        echo ""
+        echo "Docker Management:"
+        echo "  -manage-n8n            Manage n8n container (start/stop/logs/etc)"
+        echo "  -docker-cleanup        Clean up Docker resources"
+        echo ""
+        echo "System:"
+        echo "  update, -update        Update script from repository"
+        echo "  help, -help, -h        Show this help"
+        echo ""
+        echo "Running without options starts the interactive menu"
+        echo ""
+        exit 0
+        ;;
+esac
 
+# Main execution
 load_config
-menu
+
+# Check if running with sudo/root
+check_root
+
+# Start menu if no command line options
+if [[ $# -eq 0 ]]; then
+    menu
+fi
