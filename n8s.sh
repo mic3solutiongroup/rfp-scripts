@@ -22,11 +22,19 @@ save_config() {
     mkdir -p /etc/n8s
     {
         echo "NGINX_PORT=$NGINX_PORT"
-        echo "SERVER_IP=$SERVER_IP"
+        echo "SERVER_IP='$SERVER_IP'"
         echo "N8N_INSTALLED=$N8N_INSTALLED"
         echo "DOCKER_INSTALLED=$DOCKER_INSTALLED"
-        echo "N8N_DIR=$N8N_DIR"
-        declare -p PORT_MAPPINGS 2>/dev/null || echo "declare -A PORT_MAPPINGS=()"
+        echo "N8N_DIR='$N8N_DIR'"
+        if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+            echo "declare -gA PORT_MAPPINGS=("
+            for key in "${!PORT_MAPPINGS[@]}"; do
+                echo "  ['$key']='${PORT_MAPPINGS[$key]}'"
+            done
+            echo ")"
+        else
+            echo "declare -gA PORT_MAPPINGS=()"
+        fi
     } > "$CONFIG_FILE"
 }
 
@@ -246,7 +254,7 @@ N8NEOF
     nginx -t && systemctl reload nginx
     
     N8N_INSTALLED=true
-    PORT_MAPPINGS["/n8n/"]=5678
+    PORT_MAPPINGS['/n8n/']=5678
     save_config
     
     echo ""
@@ -281,7 +289,7 @@ RTEOF
     
     nginx -t && systemctl reload nginx
     
-    PORT_MAPPINGS["$path"]=$port
+    PORT_MAPPINGS["$path"]="$port"
     save_config
     
     echo "Route added: http://$SERVER_IP:$NGINX_PORT$path -> localhost:$port"
@@ -315,7 +323,7 @@ remove_route() {
         
         for path in "${!PORT_MAPPINGS[@]}"; do
             if [[ "$path" == *"$name"* ]]; then
-                unset PORT_MAPPINGS["$path"]
+                unset 'PORT_MAPPINGS[$path]'
                 break
             fi
         done
