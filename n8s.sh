@@ -322,38 +322,66 @@ write_n8n_route() {
 
     echo ""
     echo "=== n8n Access Configuration ==="
-    echo "How do you want to access n8n?"
-    echo "1) Path-based (e.g., http://yourserver:${NGINX_PORT}/n8n/)"
-    echo "2) Port-based (e.g., http://yourserver:5678 - direct access)"
+    echo "How do you want to access n8n via nginx?"
     echo ""
-    read -p "Select option (1 or 2) [1]: " access_type
-    access_type="${access_type:-1}"
+    echo "1) Direct Access (Root Path)"
+    echo "   External: http://${SERVER_IP}:${NGINX_PORT}/"
+    echo "   nginx forwards root path directly to n8n"
+    echo ""
+    echo "2) Path-Based Access (Subpath)"
+    echo "   External: http://${SERVER_IP}:${NGINX_PORT}/n8n/"
+    echo "   nginx forwards a subpath to n8n"
+    echo ""
+    read -p "Select option (1 or 2) [2]: " access_type
+    access_type="${access_type:-2}"
+
+    # n8n always runs on localhost:5678 internally
+    local n8n_internal_port=5678
 
     if [[ "$access_type" == "1" ]]; then
-        # Path-based access
-        read -p "Enter nginx path for n8n [/n8n/]: " n8n_path
+        # Direct Access - Root Path
+        log_info "Configuring direct access (root path)..."
+
+        # Create nginx config for root path
+        cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
+location / {
+    proxy_pass http://127.0.0.1:5678/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Port $server_port;
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
+}
+N8NEOF
+
+        PORT_MAPPINGS["/"]="$n8n_internal_port"
+        N8N_BASE_PATH="/"
+        log_success "Direct access configured: http://${SERVER_IP}:${NGINX_PORT}/ -> http://127.0.0.1:${n8n_internal_port}/"
+
+    else
+        # Path-Based Access - Subpath
+        read -p "Enter nginx subpath for n8n [/n8n/]: " n8n_path
         n8n_path="${n8n_path:-/n8n/}"
 
         # Ensure path starts and ends with /
         [[ ! "$n8n_path" =~ ^/ ]] && n8n_path="/$n8n_path"
         [[ ! "$n8n_path" =~ /$ ]] && n8n_path="$n8n_path/"
 
-        read -p "Enter n8n internal port [5678]: " n8n_port
-        n8n_port="${n8n_port:-5678}"
+        log_info "Configuring path-based access (subpath: ${n8n_path})..."
 
-        read -p "Does n8n use a base path? (y/n) [y]: " has_base_path
-        has_base_path="${has_base_path:-y}"
-
-        if [[ "$has_base_path" == "y" ]]; then
-            proxy_target="http://127.0.0.1:${n8n_port}/"
-        else
-            proxy_target="http://127.0.0.1:${n8n_port}"
-        fi
-
-        # Create path-based configuration
+        # Create nginx config for subpath
         cat > "$ROUTES_DIR/n8n.conf" << N8NEOF
 location ${n8n_path} {
-    proxy_pass ${proxy_target};
+    proxy_pass http://127.0.0.1:${n8n_internal_port}/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -375,22 +403,12 @@ location = ${n8n_path%/} {
 }
 N8NEOF
 
-        PORT_MAPPINGS["$n8n_path"]="$n8n_port"
-        log_success "Path-based n8n route configured: http://${SERVER_IP}:${NGINX_PORT}${n8n_path} -> localhost:${n8n_port}"
-
-    else
-        # Port-based access (no nginx proxy)
-        read -p "Enter n8n port [5678]: " n8n_port
-        n8n_port="${n8n_port:-5678}"
-
-        log_info "Port-based access selected. n8n will be directly accessible at:"
-        log_info "  http://${SERVER_IP}:${n8n_port}"
-        log_warning "Note: Ensure Docker publishes port ${n8n_port} (not just 127.0.0.1:${n8n_port})"
-
-        # Remove any existing n8n nginx config
-        rm -f "$ROUTES_DIR/n8n.conf"
-        log_success "Port-based n8n access configured"
+        PORT_MAPPINGS["$n8n_path"]="$n8n_internal_port"
+        N8N_BASE_PATH="$n8n_path"
+        log_success "Path-based access configured: http://${SERVER_IP}:${NGINX_PORT}${n8n_path} -> http://127.0.0.1:${n8n_internal_port}/"
     fi
+
+    return 0  # Signal that nginx reload is needed
 }
 
 # Install n8n
@@ -425,6 +443,36 @@ install_n8n() {
     log_info "Creating Docker volume for n8n..."
     docker volume create n8n_data 2>/dev/null || log_warning "Volume might already exist"
 
+    # Ask about access mode FIRST (before generating docker-compose)
+    echo ""
+    echo "=== n8n Access Configuration ==="
+    echo "How do you want to access n8n via nginx?"
+    echo ""
+    echo "1) Direct Access (Root Path)"
+    echo "   External: http://${SERVER_IP}:${NGINX_PORT}/"
+    echo "   nginx forwards root path directly to n8n"
+    echo ""
+    echo "2) Path-Based Access (Subpath)"
+    echo "   External: http://${SERVER_IP}:${NGINX_PORT}/n8n/"
+    echo "   nginx forwards a subpath to n8n"
+    echo ""
+    read -p "Select option (1 or 2) [2]: " access_type
+    access_type="${access_type:-2}"
+
+    # Set base path based on choice
+    if [[ "$access_type" == "1" ]]; then
+        N8N_BASE_PATH="/"
+        N8N_EXTERNAL_URL="http://${SERVER_IP}:${NGINX_PORT}/"
+    else
+        read -p "Enter nginx subpath for n8n [/n8n/]: " n8n_path
+        n8n_path="${n8n_path:-/n8n/}"
+        # Ensure path starts and ends with /
+        [[ ! "$n8n_path" =~ ^/ ]] && n8n_path="/$n8n_path"
+        [[ ! "$n8n_path" =~ /$ ]] && n8n_path="$n8n_path/"
+        N8N_BASE_PATH="$n8n_path"
+        N8N_EXTERNAL_URL="http://${SERVER_IP}:${NGINX_PORT}${n8n_path}"
+    fi
+
     # Ask about network mode
     echo ""
     echo "=== Docker Network Mode ==="
@@ -453,8 +501,8 @@ services:
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_HOST=0.0.0.0
-      - N8N_BASE_URL=/n8n/
-      - N8N_EDITOR_BASE_URL=http://${SERVER_IP}:${NGINX_PORT}/n8n/
+      - N8N_BASE_URL=${N8N_BASE_PATH}
+      - N8N_EDITOR_BASE_URL=${N8N_EXTERNAL_URL}
       - WEBHOOK_URL=http://${SERVER_IP}:${NGINX_PORT}/
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_PUSH_BACKEND=websocket
@@ -485,8 +533,8 @@ services:
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_HOST=0.0.0.0
-      - N8N_BASE_URL=/n8n/
-      - N8N_EDITOR_BASE_URL=http://${SERVER_IP}:${NGINX_PORT}/n8n/
+      - N8N_BASE_URL=${N8N_BASE_PATH}
+      - N8N_EDITOR_BASE_URL=${N8N_EXTERNAL_URL}
       - WEBHOOK_URL=http://${SERVER_IP}:${NGINX_PORT}/
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_PUSH_BACKEND=websocket
@@ -530,8 +578,59 @@ DCEOF
         sleep 2
     done
 
-    # Configure nginx route
-    write_n8n_route
+    # Create nginx route configuration based on earlier choice
+    log_info "Configuring nginx reverse proxy..."
+    mkdir -p "$ROUTES_DIR"
+
+    if [[ "$access_type" == "1" ]]; then
+        # Direct Access - Root Path
+        cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
+location / {
+    proxy_pass http://127.0.0.1:5678/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Port $server_port;
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
+}
+N8NEOF
+        PORT_MAPPINGS["/"]="5678"
+    else
+        # Path-Based Access - Subpath
+        cat > "$ROUTES_DIR/n8n.conf" << N8NEOF
+location ${N8N_BASE_PATH} {
+    proxy_pass http://127.0.0.1:5678/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$host;
+    proxy_set_header X-Forwarded-Port \$server_port;
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
+}
+
+location = ${N8N_BASE_PATH%/} {
+    return 301 ${N8N_BASE_PATH};
+}
+N8NEOF
+        PORT_MAPPINGS["$N8N_BASE_PATH"]="5678"
+    fi
 
     # Reload nginx
     if nginx -t && systemctl reload nginx; then
@@ -542,16 +641,21 @@ DCEOF
 
     # Update configuration
     N8N_INSTALLED=true
-    PORT_MAPPINGS['/n8n/']=5678
     save_config
 
     log_success "n8n installation completed!"
     echo ""
     echo "================================================"
-    echo "n8n is now accessible at:"
-    echo "URL: http://${SERVER_IP}:${NGINX_PORT}/n8n/"
-    echo "Local: http://127.0.0.1:5678/"
-    echo "Directory: $N8N_DIR"
+    echo "n8n Access Information:"
+    echo "================================================"
+    echo ""
+    echo "  External: ${N8N_EXTERNAL_URL}"
+    echo "  Local:    http://127.0.0.1:5678/"
+    echo ""
+    echo "  nginx Port: ${NGINX_PORT}"
+    echo "  n8n Base Path: ${N8N_BASE_PATH}"
+    echo "  Directory: $N8N_DIR"
+    echo ""
     echo "================================================"
     echo ""
 }
@@ -1052,7 +1156,21 @@ system_status() {
     echo "=== Access Information ==="
     echo "Nginx Router: http://$SERVER_IP:$NGINX_PORT"
     if [[ "$N8N_INSTALLED" == "true" ]]; then
-        echo "n8n Interface: http://$SERVER_IP:$NGINX_PORT/n8n/"
+        # Find the configured n8n path from PORT_MAPPINGS
+        local n8n_path=""
+        for path in "${!PORT_MAPPINGS[@]}"; do
+            if [[ "${PORT_MAPPINGS[$path]}" == "5678" ]]; then
+                n8n_path="$path"
+                break
+            fi
+        done
+
+        if [[ -n "$n8n_path" ]]; then
+            echo "n8n External: http://$SERVER_IP:$NGINX_PORT${n8n_path}"
+            echo "n8n Local:    http://127.0.0.1:5678/"
+        else
+            echo "n8n:          Status unknown (check configuration)"
+        fi
     fi
 }
 
