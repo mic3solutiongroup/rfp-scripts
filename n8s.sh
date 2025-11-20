@@ -425,9 +425,53 @@ install_n8n() {
     log_info "Creating Docker volume for n8n..."
     docker volume create n8n_data 2>/dev/null || log_warning "Volume might already exist"
 
+    # Ask about network mode
+    echo ""
+    echo "=== Docker Network Mode ==="
+    echo "1) Host network (recommended - avoids port permission issues)"
+    echo "2) Bridge network (isolated networking)"
+    echo ""
+    read -p "Select network mode (1 or 2) [1]: " network_mode_choice
+    network_mode_choice="${network_mode_choice:-1}"
+
     # Create docker-compose file
     log_info "Creating docker-compose configuration..."
-    cat > "$N8N_DIR/docker-compose.yml" << DCEOF
+
+    if [[ "$network_mode_choice" == "1" ]]; then
+        # Host network mode
+        log_info "Using host network mode..."
+        cat > "$N8N_DIR/docker-compose.yml" << DCEOF
+version: '3.8'
+
+services:
+  n8n:
+    image: docker.io/n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_HOST=0.0.0.0
+      - N8N_BASE_URL=/n8n/
+      - N8N_EDITOR_BASE_URL=http://${SERVER_IP}:${NGINX_PORT}/n8n/
+      - WEBHOOK_URL=http://${SERVER_IP}:${NGINX_PORT}/
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PUSH_BACKEND=websocket
+      - N8N_SECURE_COOKIE=false
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=UTC
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+    external: true
+DCEOF
+    else
+        # Bridge network mode
+        log_info "Using bridge network mode..."
+        cat > "$N8N_DIR/docker-compose.yml" << DCEOF
 version: '3.8'
 
 services:
@@ -462,6 +506,7 @@ networks:
   n8n_network:
     driver: bridge
 DCEOF
+    fi
 
     # Start n8n
     log_info "Starting n8n container..."
