@@ -6,26 +6,19 @@ CONFIG_FILE="/etc/n8s/config.env"
 SCRIPT_PATH="/usr/local/bin/n8s"
 REPO_URL="https://raw.githubusercontent.com/mic3solutiongroup/rfp-scripts/refs/heads/main/n8s.sh"
 
-# Defaults (used on first run, can be overridden in config)
 N8N_DIR="${HOME}/rfp/n8n"
 NGINX_CONF="/etc/nginx/sites-available/n8s-router.conf"
 ROUTES_DIR="/etc/nginx/routes-n8s"
 NGINX_PORT_DEFAULT=1440
 
-# Ensure associative array exists
 declare -gA PORT_MAPPINGS || true
 
-#######################################
-# Config handling
-#######################################
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck source=/dev/null
         source "$CONFIG_FILE"
     else
         echo "No existing config found. Let's set things up."
 
-        # Ask for NGINX port
         read -p "Enter nginx port to listen on [${NGINX_PORT_DEFAULT}]: " input_port
         if [[ -n "${input_port:-}" ]]; then
             NGINX_PORT="$input_port"
@@ -33,7 +26,6 @@ load_config() {
             NGINX_PORT="$NGINX_PORT_DEFAULT"
         fi
 
-        # Ask for n8n directory (optional)
         read -p "Enter n8n directory [${N8N_DIR}]: " input_dir
         if [[ -n "${input_dir:-}" ]]; then
             N8N_DIR="$input_dir"
@@ -47,7 +39,6 @@ load_config() {
         save_config
     fi
 
-    # Fallbacks if config file was missing values
     : "${NGINX_PORT:=$NGINX_PORT_DEFAULT}"
     : "${SERVER_IP:=$(curl -s ifconfig.me || echo "localhost")}"
     : "${N8N_DIR:=${HOME}/rfp/n8n}"
@@ -77,9 +68,6 @@ save_config() {
     } > "$CONFIG_FILE"
 }
 
-#######################################
-# Self-update
-#######################################
 update_script() {
     echo "Updating n8s from repository..."
     curl -fsSL "$REPO_URL" -o /tmp/n8s_new.sh
@@ -94,9 +82,6 @@ update_script() {
     fi
 }
 
-#######################################
-# Docker handling
-#######################################
 install_docker() {
     echo "Installing Docker and Docker Compose..."
 
@@ -118,7 +103,7 @@ install_docker() {
 
     apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tee /tmp/docker_install.log
 
-    if grep -q "Errors were encountered while processing" /tmp/docker_install.log; then
+    if grep -q "Errors were encountered while processing" /tmp/docker_install.log 2>/dev/null; then
         echo "Warning: Some package errors occurred, attempting to fix..."
         dpkg --configure -a || true
         apt --fix-broken install -y || true
@@ -184,22 +169,18 @@ check_docker() {
     return 0
 }
 
-#######################################
-# Nginx handling
-#######################################
+patch_nginx_conf() {
+    return 0
+}
+
 generate_nginx_config() {
     mkdir -p "$ROUTES_DIR"
 
-    # Clean up legacy 8443 configs from older versions
-    if [[ -f /etc/nginx/sites-available/8443-router.conf ]]; then
-        rm -f /etc/nginx/sites-available/8443-router.conf
-    fi
-    if [[ -f /etc/nginx/sites-enabled/8443-router.conf ]]; then
-        rm -f /etc/nginx/sites-enabled/8443-router.conf
-    fi
-    if [[ -d /etc/nginx/routes-8443 ]]; then
-        rmdir /etc/nginx/routes-8443 2>/dev/null || true
-    fi
+    rm -f /etc/nginx/sites-available/8443-router.conf 2>/dev/null || true
+    rm -f /etc/nginx/sites-enabled/8443-router.conf 2>/dev/null || true
+    rmdir /etc/nginx/routes-8443 2>/dev/null || true
+
+    patch_nginx_conf
 
     cat > "$NGINX_CONF" << 'NGXEOF'
 server {
@@ -237,9 +218,28 @@ install_nginx() {
     generate_nginx_config
 }
 
-#######################################
-# n8n install/reinstall
-#######################################
+write_n8n_route() {
+    mkdir -p "$ROUTES_DIR"
+    cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
+location /n8n/ {
+    proxy_pass http://127.0.0.1:5678/n8n/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Origin "$scheme://$host";
+    proxy_buffering off;
+    proxy_request_buffering off;
+}
+location = /n8n {
+    return 301 /n8n/;
+}
+N8NEOF
+}
+
 install_n8n() {
     if ! check_docker; then
         echo "Docker not installed or not running. Please install Docker first (Option 8)"
@@ -301,28 +301,7 @@ DCEOF
         docker-compose up -d
     fi
 
-    mkdir -p "$ROUTES_DIR"
-
-    cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
-location /n8n/ {
-    proxy_pass http://127.0.0.1:5678/n8n/;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header Origin "http://SERVER_IP_PLACEHOLDER";
-    proxy_buffering off;
-    proxy_request_buffering off;
-}
-location = /n8n {
-    return 301 /n8n/;
-}
-N8NEOF
-
-    sed -i "s/SERVER_IP_PLACEHOLDER/$SERVER_IP/g" "$ROUTES_DIR/n8n.conf"
+    write_n8n_route
 
     nginx -t && systemctl reload nginx
 
@@ -382,9 +361,6 @@ reinstall_n8n() {
     install_n8n
 }
 
-#######################################
-# Route management
-#######################################
 add_route() {
     read -p "Enter nginx path (e.g., /api/): " path
     read -p "Enter internal port: " port
@@ -443,7 +419,6 @@ remove_route() {
         rm -f "$ROUTES_DIR/${name}.conf"
         nginx -t && systemctl reload nginx
 
-        # Also clean from PORT_MAPPINGS if path contains the name
         for path in "${!PORT_MAPPINGS[@]}"; do
             if [[ "$path" == *"$name"* ]]; then
                 unset 'PORT_MAPPINGS[$path]'
@@ -458,9 +433,6 @@ remove_route() {
     fi
 }
 
-#######################################
-# Settings & status
-#######################################
 change_settings() {
     read -p "Enter new nginx port [$NGINX_PORT]: " new_port
     [[ -n "${new_port:-}" ]] && NGINX_PORT="$new_port"
@@ -476,7 +448,6 @@ change_settings() {
     echo "Regenerating nginx config for new port..."
     generate_nginx_config
 
-    # Update n8n URLs if installed
     if [[ "${N8N_INSTALLED:-false}" == "true" && -f "$N8N_DIR/docker-compose.yml" ]]; then
         cd "$N8N_DIR"
         sed -i "s|N8N_EDITOR_BASE_URL=.*|N8N_EDITOR_BASE_URL=http://$SERVER_IP:$NGINX_PORT/n8n/|" docker-compose.yml
@@ -489,14 +460,32 @@ change_settings() {
             docker-compose down
             docker-compose up -d
         fi
-
-        if [[ -f "$ROUTES_DIR/n8n.conf" ]]; then
-            sed -i "s|Origin \"http://.*\"|Origin \"http://$SERVER_IP\"|" "$ROUTES_DIR/n8n.conf"
-        fi
     fi
 
     nginx -t && systemctl reload nginx
     echo "Settings updated"
+}
+
+refresh_config() {
+    echo "Refreshing nginx and n8n configs using current settings..."
+    generate_nginx_config
+    write_n8n_route
+
+    nginx -t && systemctl reload nginx
+
+    if [[ "${N8N_INSTALLED:-false}" == "true" && -f "$N8N_DIR/docker-compose.yml" ]]; then
+        echo "Restarting n8n container to apply any config changes..."
+        cd "$N8N_DIR"
+        if docker compose version &> /dev/null 2>&1; then
+            docker compose down
+            docker compose up -d
+        else
+            docker-compose down
+            docker-compose up -d
+        fi
+    fi
+
+    echo "Config refresh complete."
 }
 
 docker_status() {
@@ -516,14 +505,11 @@ docker_status() {
     fi
 }
 
-#######################################
-# Menu
-#######################################
 menu() {
     while true; do
         clear
         echo "╔════════════════════════════════════╗"
-        echo "║      N8S - Nginx Manager v3.1     ║"
+        echo "║      N8S - Nginx Manager v3.3     ║"
         echo "╚════════════════════════════════════╝"
         echo ""
         echo "  1) Install n8n"
@@ -536,6 +522,7 @@ menu() {
         echo "  8) Install Docker"
         echo "  9) Exit"
         echo " 10) Reinstall n8n"
+        echo " 11) Refresh Config (nginx + n8n)"
         echo ""
         read -p "Select option: " choice
 
@@ -550,14 +537,12 @@ menu() {
             8) install_docker; read -p "Press enter..." ;;
             9) exit 0 ;;
             10) reinstall_n8n; read -p "Press enter..." ;;
+            11) refresh_config; read -p "Press enter..." ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
     done
 }
 
-#######################################
-# Entry point
-#######################################
 if [[ "${1:-}" == "-update" || "${1:-}" == "update" ]]; then
     update_script
 fi
