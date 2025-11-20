@@ -14,20 +14,20 @@ load_config() {
         SERVER_IP=$(curl -s ifconfig.me || echo "localhost")
         N8N_INSTALLED=false
         DOCKER_INSTALLED=false
-        declare -A PORT_MAPPINGS
+        declare -gA PORT_MAPPINGS
     fi
 }
 
 save_config() {
     mkdir -p /etc/n8s
-    cat > "$CONFIG_FILE" << EOF
-NGINX_PORT=$NGINX_PORT
-SERVER_IP=$SERVER_IP
-N8N_INSTALLED=$N8N_INSTALLED
-DOCKER_INSTALLED=$DOCKER_INSTALLED
-N8N_DIR=$N8N_DIR
-$(declare -p PORT_MAPPINGS 2>/dev/null || echo "declare -A PORT_MAPPINGS=()")
-EOF
+    {
+        echo "NGINX_PORT=$NGINX_PORT"
+        echo "SERVER_IP=$SERVER_IP"
+        echo "N8N_INSTALLED=$N8N_INSTALLED"
+        echo "DOCKER_INSTALLED=$DOCKER_INSTALLED"
+        echo "N8N_DIR=$N8N_DIR"
+        declare -p PORT_MAPPINGS 2>/dev/null || echo "declare -A PORT_MAPPINGS=()"
+    } > "$CONFIG_FILE"
 }
 
 update_script() {
@@ -47,6 +47,8 @@ update_script() {
 install_docker() {
     echo "Installing Docker and Docker Compose..."
     
+    export DEBIAN_FRONTEND=noninteractive
+    
     apt update
     apt install -y ca-certificates curl gnupg lsb-release
     
@@ -58,23 +60,47 @@ install_docker() {
       $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
     
     apt update
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     
-    systemctl enable --now docker
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tee /tmp/docker_install.log
     
-    usermod -aG docker $USER
+    if grep -q "Errors were encountered while processing" /tmp/docker_install.log; then
+        echo "Warning: Some package errors occurred, but continuing..."
+        dpkg --configure -a
+        apt --fix-broken install -y
+    fi
     
-    if command -v docker &> /dev/null && docker compose version &> /dev/null; then
-        echo "Docker and Docker Compose installed successfully"
-        DOCKER_INSTALLED=true
-        save_config
-        return 0
+    systemctl enable docker 2>/dev/null
+    systemctl start docker 2>/dev/null
+    
+    usermod -aG docker $USER 2>/dev/null
+    
+    if command -v docker &> /dev/null; then
+        if docker compose version &> /dev/null 2>&1; then
+            echo "Docker and Docker Compose installed successfully"
+            DOCKER_INSTALLED=true
+            save_config
+            return 0
+        elif command -v docker-compose &> /dev/null; then
+            echo "Docker installed with docker-compose"
+            DOCKER_INSTALLED=true
+            save_config
+            return 0
+        else
+            echo "Installing standalone docker-compose..."
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+            DOCKER_INSTALLED=true
+            save_config
+            return 0
+        fi
     else
         echo "Docker installation failed, trying alternative method..."
-        apt install -y docker.io docker-compose
+        apt install -y docker.io
         systemctl enable --now docker
         
         if command -v docker &> /dev/null; then
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
             DOCKER_INSTALLED=true
             save_config
             echo "Docker installed via apt"
@@ -88,12 +114,15 @@ install_docker() {
 
 check_docker() {
     if ! command -v docker &> /dev/null; then
-        echo "Docker not found"
         return 1
     fi
     
-    if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
-        echo "Docker Compose not found"
+    if ! systemctl is-active --quiet docker; then
+        systemctl start docker 2>/dev/null
+        sleep 2
+    fi
+    
+    if ! docker compose version &> /dev/null 2>&1 && ! command -v docker-compose &> /dev/null; then
         return 1
     fi
     
@@ -115,6 +144,7 @@ server {
     listen NGINX_PORT_PLACEHOLDER default_server;
     listen [::]:NGINX_PORT_PLACEHOLDER default_server;
     server_name _;
+    client_max_body_size 100M;
     location = / {
         return 200 'nginx router is alive\n';
         add_header Content-Type text/plain;
@@ -133,7 +163,7 @@ NGXEOF
 
 install_n8n() {
     if ! check_docker; then
-        echo "Docker not installed. Please install Docker first (Option 8)"
+        echo "Docker not installed or not running. Please install Docker first (Option 8)"
         return 1
     fi
     
@@ -154,10 +184,9 @@ install_n8n() {
         fi
     fi
     
-    docker volume create n8n_data
+    docker volume create n8n_data 2>/dev/null
     
     cat > "$N8N_DIR/docker-compose.yml" << DCEOF
-version: '3.8'
 services:
   n8n:
     image: docker.io/n8nio/n8n:latest
@@ -186,7 +215,12 @@ DCEOF
     
     echo "Starting n8n container..."
     cd "$N8N_DIR"
-    docker compose up -d
+    
+    if docker compose version &> /dev/null 2>&1; then
+        docker compose up -d
+    else
+        docker-compose up -d
+    fi
     
     cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
 location /n8n/ {
@@ -199,6 +233,8 @@ location /n8n/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header Origin "http://SERVER_IP_PLACEHOLDER";
+    proxy_buffering off;
+    proxy_request_buffering off;
 }
 location = /n8n {
     return 301 /n8n/;
@@ -210,11 +246,16 @@ N8NEOF
     nginx -t && systemctl reload nginx
     
     N8N_INSTALLED=true
-    PORT_MAPPINGS["/n8n/"]="5678"
+    PORT_MAPPINGS["/n8n/"]=5678
     save_config
     
-    echo "n8n installed at http://$SERVER_IP:$NGINX_PORT/n8n/"
-    echo "docker-compose.yml location: $N8N_DIR/docker-compose.yml"
+    echo ""
+    echo "========================================="
+    echo "n8n installed successfully!"
+    echo "URL: http://$SERVER_IP:$NGINX_PORT/n8n/"
+    echo "Config: $N8N_DIR/docker-compose.yml"
+    echo "========================================="
+    echo ""
 }
 
 add_route() {
@@ -240,7 +281,7 @@ RTEOF
     
     nginx -t && systemctl reload nginx
     
-    PORT_MAPPINGS["$path"]="$port"
+    PORT_MAPPINGS["$path"]=$port
     save_config
     
     echo "Route added: http://$SERVER_IP:$NGINX_PORT$path -> localhost:$port"
@@ -250,26 +291,40 @@ list_routes() {
     echo "=== Current Routes ==="
     echo "Nginx Port: $NGINX_PORT"
     echo "Server IP: $SERVER_IP"
-    echo "Docker Status: $DOCKER_INSTALLED"
-    echo "n8n Status: $N8N_INSTALLED"
+    echo "Docker: $DOCKER_INSTALLED"
+    echo "n8n: $N8N_INSTALLED"
     echo "n8n Directory: $N8N_DIR"
     echo ""
-    for path in "${!PORT_MAPPINGS[@]}"; do
-        echo "http://$SERVER_IP:$NGINX_PORT$path -> localhost:${PORT_MAPPINGS[$path]}"
-    done
+    if [[ ${#PORT_MAPPINGS[@]} -eq 0 ]]; then
+        echo "No routes configured"
+    else
+        for path in "${!PORT_MAPPINGS[@]}"; do
+            echo "http://$SERVER_IP:$NGINX_PORT$path -> localhost:${PORT_MAPPINGS[$path]}"
+        done
+    fi
 }
 
 remove_route() {
-    read -p "Enter path to remove (e.g., /api/): " path
-    read -p "Enter route name: " name
+    list_routes
+    echo ""
+    read -p "Enter route name to remove: " name
     
-    rm -f "$ROUTES_DIR/${name}.conf"
-    nginx -t && systemctl reload nginx
-    
-    unset PORT_MAPPINGS["$path"]
-    save_config
-    
-    echo "Route removed"
+    if [[ -f "$ROUTES_DIR/${name}.conf" ]]; then
+        rm -f "$ROUTES_DIR/${name}.conf"
+        nginx -t && systemctl reload nginx
+        
+        for path in "${!PORT_MAPPINGS[@]}"; do
+            if [[ "$path" == *"$name"* ]]; then
+                unset PORT_MAPPINGS["$path"]
+                break
+            fi
+        done
+        
+        save_config
+        echo "Route removed"
+    else
+        echo "Route not found"
+    fi
 }
 
 change_settings() {
@@ -290,8 +345,14 @@ change_settings() {
         cd "$N8N_DIR"
         sed -i "s|N8N_EDITOR_BASE_URL=.*|N8N_EDITOR_BASE_URL=http://$SERVER_IP:$NGINX_PORT/n8n/|" docker-compose.yml
         sed -i "s|WEBHOOK_URL=.*|WEBHOOK_URL=http://$SERVER_IP:$NGINX_PORT/|" docker-compose.yml
-        docker compose down
-        docker compose up -d
+        
+        if docker compose version &> /dev/null 2>&1; then
+            docker compose down
+            docker compose up -d
+        else
+            docker-compose down
+            docker-compose up -d
+        fi
         
         sed -i "s|Origin \"http://.*\"|Origin \"http://$SERVER_IP\"|" "$ROUTES_DIR/n8n.conf"
     fi
@@ -303,14 +364,17 @@ change_settings() {
 docker_status() {
     echo "=== Docker Status ==="
     if check_docker; then
-        echo "Docker: Installed"
+        echo "Docker: Installed and Running"
         docker --version
-        docker compose version 2>/dev/null || docker-compose --version
+        docker compose version 2>/dev/null || docker-compose --version 2>/dev/null
         echo ""
         echo "Running containers:"
-        docker ps
+        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        echo ""
+        echo "Docker volumes:"
+        docker volume ls | grep n8n
     else
-        echo "Docker: Not installed"
+        echo "Docker: Not installed or not running"
     fi
 }
 
@@ -318,7 +382,7 @@ menu() {
     while true; do
         clear
         echo "╔════════════════════════════════════╗"
-        echo "║      N8S - Nginx Manager v2.0     ║"
+        echo "║      N8S - Nginx Manager v2.1     ║"
         echo "╚════════════════════════════════════╝"
         echo ""
         echo "  1) Install n8n"
@@ -343,7 +407,7 @@ menu() {
             7) docker_status; read -p "Press enter..." ;;
             8) install_docker; read -p "Press enter..." ;;
             9) exit 0 ;;
-            *) echo "Invalid option" ;;
+            *) echo "Invalid option"; sleep 1 ;;
         esac
     done
 }
