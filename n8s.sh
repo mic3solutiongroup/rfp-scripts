@@ -268,6 +268,88 @@ install_docker() {
     fi
 }
 
+# Reinstall Docker (complete removal and fresh install)
+reinstall_docker() {
+    log_warning "=== Docker Reinstallation ==="
+    echo ""
+    echo "This will:"
+    echo "  1. Stop all Docker containers"
+    echo "  2. Remove all Docker packages"
+    echo "  3. Clean up Docker directories"
+    echo "  4. Reinstall Docker from scratch"
+    echo ""
+    log_error "WARNING: This will stop all running containers!"
+    echo ""
+    read -p "Continue with Docker reinstallation? (yes/no): " confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        log_info "Reinstallation cancelled"
+        return 1
+    fi
+
+    # Stop Docker service
+    log_info "Stopping Docker service..."
+    systemctl stop docker 2>/dev/null || true
+    systemctl stop docker.socket 2>/dev/null || true
+    pkill -9 dockerd 2>/dev/null || true
+
+    # Remove Docker packages
+    log_info "Removing Docker packages..."
+    apt-get remove -y docker docker-engine docker.io containerd runc docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+
+    # Clean up Docker directories
+    log_info "Cleaning up Docker directories..."
+    rm -rf /var/lib/docker 2>/dev/null || true
+    rm -rf /var/lib/containerd 2>/dev/null || true
+    rm -rf /etc/docker 2>/dev/null || true
+    rm -rf /var/run/docker.sock 2>/dev/null || true
+    rm -rf /usr/local/bin/docker-compose 2>/dev/null || true
+
+    # Remove Docker repository files
+    log_info "Removing Docker repository configurations..."
+    rm -f /etc/apt/sources.list.d/docker.list 2>/dev/null || true
+    rm -f /etc/apt/keyrings/docker.gpg 2>/dev/null || true
+
+    log_success "Docker removed successfully"
+    echo ""
+
+    # Reinstall Docker using get.docker.com script
+    log_info "Reinstalling Docker using official installation script..."
+
+    if ! curl -fsSL https://get.docker.com -o /tmp/get-docker.sh; then
+        log_error "Failed to download Docker installation script"
+        return 1
+    fi
+
+    if ! sh /tmp/get-docker.sh; then
+        log_error "Docker installation failed"
+        rm -f /tmp/get-docker.sh
+        return 1
+    fi
+
+    rm -f /tmp/get-docker.sh
+
+    # Start and enable Docker
+    log_info "Starting Docker service..."
+    systemctl enable docker 2>/dev/null || true
+    systemctl start docker 2>/dev/null || true
+    sleep 3
+
+    # Verify installation
+    if check_docker; then
+        log_success "Docker reinstalled successfully!"
+        docker --version
+        DOCKER_INSTALLED=true
+        save_config
+        return 0
+    else
+        log_error "Docker reinstallation completed but verification failed"
+        log_info "You may need to reboot the system"
+        return 1
+    fi
+}
+
 # Check nginx status
 check_nginx() {
     # Check if nginx command exists
@@ -444,6 +526,109 @@ install_nginx() {
 
     # Generate nginx configuration
     generate_nginx_config
+}
+
+# Reinstall nginx (complete removal and fresh install)
+reinstall_nginx() {
+    log_warning "=== nginx Reinstallation ==="
+    echo ""
+    echo "This will:"
+    echo "  1. Stop nginx service"
+    echo "  2. Remove nginx packages"
+    echo "  3. Clean up nginx configurations"
+    echo "  4. Reinstall nginx"
+    echo "  5. Regenerate configurations"
+    echo ""
+    log_warning "NOTE: All custom nginx configurations will be lost!"
+    log_info "n8s routes will be regenerated automatically"
+    echo ""
+    read -p "Continue with nginx reinstallation? (yes/no): " confirm
+
+    if [[ "$confirm" != "yes" ]]; then
+        log_info "Reinstallation cancelled"
+        return 1
+    fi
+
+    # Backup current routes
+    log_info "Backing up n8s routes..."
+    if [[ -d "$ROUTES_DIR" ]]; then
+        cp -r "$ROUTES_DIR" /tmp/n8s-routes-backup 2>/dev/null || true
+        log_success "Routes backed up to /tmp/n8s-routes-backup"
+    fi
+
+    # Stop nginx service
+    log_info "Stopping nginx service..."
+    systemctl stop nginx 2>/dev/null || true
+    pkill -9 nginx 2>/dev/null || true
+
+    # Remove nginx packages
+    log_info "Removing nginx packages..."
+    apt-get remove -y nginx nginx-common nginx-core 2>/dev/null || true
+    apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true
+    apt-get autoremove -y 2>/dev/null || true
+
+    # Clean up nginx directories and configs
+    log_info "Cleaning up nginx configurations..."
+    rm -rf /etc/nginx 2>/dev/null || true
+    rm -rf /var/log/nginx 2>/dev/null || true
+    rm -rf /var/www/html 2>/dev/null || true
+    rm -rf /usr/share/nginx 2>/dev/null || true
+
+    log_success "nginx removed successfully"
+    echo ""
+
+    # Reinstall nginx
+    log_info "Reinstalling nginx..."
+    export DEBIAN_FRONTEND=noninteractive
+
+    if ! apt-get update; then
+        log_error "Failed to update package lists"
+        return 1
+    fi
+
+    if ! apt-get install -y nginx; then
+        log_error "nginx installation failed"
+        return 1
+    fi
+
+    # Start and enable nginx
+    log_info "Starting nginx service..."
+    systemctl enable nginx 2>/dev/null || true
+    systemctl start nginx 2>/dev/null || true
+    sleep 2
+
+    # Verify installation
+    if command -v nginx &> /dev/null; then
+        log_success "nginx reinstalled successfully!"
+        nginx -v
+        NGINX_INSTALLED=true
+        save_config
+
+        # Regenerate nginx configuration
+        log_info "Regenerating nginx configuration..."
+        generate_nginx_config
+
+        # Restore routes if backup exists
+        if [[ -d /tmp/n8s-routes-backup ]]; then
+            log_info "Restoring n8s routes..."
+            mkdir -p "$ROUTES_DIR"
+            cp -r /tmp/n8s-routes-backup/* "$ROUTES_DIR/" 2>/dev/null || true
+            rm -rf /tmp/n8s-routes-backup
+
+            # Reload nginx with restored routes
+            if nginx -t 2>/dev/null; then
+                systemctl reload nginx
+                log_success "Routes restored successfully"
+            else
+                log_warning "Some routes may need to be reconfigured"
+            fi
+        fi
+
+        return 0
+    else
+        log_error "nginx reinstallation verification failed"
+        return 1
+    fi
 }
 
 # Generate nginx configuration
@@ -1487,7 +1672,12 @@ menu() {
         echo "  === System ==="
         echo "  16) System Status"
         echo "  17) Update Script"
-        echo "  18) Exit"
+        echo ""
+        echo "  === Troubleshooting/Repair ==="
+        echo "  18) Reinstall Docker"
+        echo "  19) Reinstall nginx"
+        echo ""
+        echo "  20) Exit"
         echo ""
         read -p "Select option: " choice
 
@@ -1509,7 +1699,9 @@ menu() {
             15) docker_cleanup; read -p "Press enter to continue... " ;;
             16) system_status; read -p "Press enter to continue... " ;;
             17) update_script ;;
-            18) log_info "Goodbye!"; exit 0 ;;
+            18) reinstall_docker; read -p "Press enter to continue... " ;;
+            19) reinstall_nginx; read -p "Press enter to continue... " ;;
+            20) log_info "Goodbye!"; exit 0 ;;
             *) log_error "Invalid option"; sleep 1 ;;
         esac
     done
@@ -1564,6 +1756,14 @@ case "${1:-}" in
         load_config
         start_services
         ;;
+    "-reinstall-docker")
+        load_config
+        reinstall_docker
+        ;;
+    "-reinstall-nginx")
+        load_config
+        reinstall_nginx
+        ;;
     "-help"|"help"|"-h")
         echo "N8S Manager - nginx + Docker + n8n Super Script"
         echo ""
@@ -1583,6 +1783,10 @@ case "${1:-}" in
         echo "Docker Management:"
         echo "  -manage-n8n            Manage n8n container (start/stop/logs/etc)"
         echo "  -docker-cleanup        Clean up Docker resources"
+        echo ""
+        echo "Troubleshooting/Repair:"
+        echo "  -reinstall-docker      Completely remove and reinstall Docker"
+        echo "  -reinstall-nginx       Completely remove and reinstall nginx"
         echo ""
         echo "System:"
         echo "  update, -update        Update script from repository"
