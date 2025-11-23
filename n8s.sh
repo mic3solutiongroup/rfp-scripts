@@ -288,6 +288,97 @@ check_docker() {
     return 1
 }
 
+# Start Docker service
+start_docker() {
+    log_info "Starting Docker service..."
+
+    if check_docker; then
+        log_success "Docker is already running"
+        return 0
+    fi
+
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed. Please install Docker first."
+        return 1
+    fi
+
+    # Try to enable and start Docker
+    if systemctl enable docker 2>/dev/null; then
+        log_success "Docker service enabled"
+    fi
+
+    if systemctl start docker 2>/dev/null; then
+        sleep 3
+        if check_docker; then
+            log_success "Docker started successfully"
+            DOCKER_INSTALLED=true
+            save_config
+            return 0
+        fi
+    fi
+
+    # Try alternative start method
+    log_warning "Attempting alternative Docker start method..."
+    dockerd & 2>/dev/null || true
+    sleep 5
+
+    if check_docker; then
+        log_success "Docker started successfully"
+        DOCKER_INSTALLED=true
+        save_config
+        return 0
+    else
+        log_error "Failed to start Docker"
+        return 1
+    fi
+}
+
+# Start nginx service
+start_nginx() {
+    log_info "Starting nginx service..."
+
+    if check_nginx; then
+        log_success "nginx is already running"
+        return 0
+    fi
+
+    if ! command -v nginx &> /dev/null; then
+        log_error "nginx is not installed. Please install nginx first."
+        return 1
+    fi
+
+    # Try to enable and start nginx
+    if systemctl enable nginx 2>/dev/null; then
+        log_success "nginx service enabled"
+    fi
+
+    if systemctl start nginx 2>/dev/null; then
+        sleep 2
+        if check_nginx; then
+            log_success "nginx started successfully"
+            NGINX_INSTALLED=true
+            save_config
+            return 0
+        fi
+    fi
+
+    # Try direct nginx start (for non-systemd systems)
+    log_warning "Attempting direct nginx start..."
+    if nginx 2>/dev/null; then
+        sleep 2
+        if check_nginx; then
+            log_success "nginx started successfully"
+            NGINX_INSTALLED=true
+            save_config
+            return 0
+        fi
+    fi
+
+    log_error "Failed to start nginx. It may be managed by a control panel."
+    log_info "Please start nginx through your control panel interface."
+    return 1
+}
+
 # Install and configure nginx
 install_nginx() {
     log_info "Starting nginx installation..."
@@ -1187,6 +1278,82 @@ manage_n8n_container() {
     fi
 }
 
+# Start services (Docker and nginx)
+start_services() {
+    echo "=== Start/Enable Services ==="
+    echo ""
+
+    local needs_restart=false
+
+    # Check Docker
+    if ! check_docker; then
+        if command -v docker &> /dev/null; then
+            echo -e "${YELLOW}Docker is installed but not running${NC}"
+            read -p "Start Docker? (y/n): " start_docker_choice
+            if [[ "$start_docker_choice" == "y" ]]; then
+                if start_docker; then
+                    needs_restart=true
+                fi
+            fi
+        else
+            echo -e "${RED}Docker is not installed${NC}"
+            read -p "Install Docker now? (y/n): " install_docker_choice
+            if [[ "$install_docker_choice" == "y" ]]; then
+                install_docker
+                needs_restart=true
+            fi
+        fi
+    else
+        echo -e "${GREEN}Docker is already running${NC}"
+    fi
+
+    echo ""
+
+    # Check nginx
+    if ! check_nginx; then
+        if command -v nginx &> /dev/null; then
+            echo -e "${YELLOW}nginx is installed but not running${NC}"
+            read -p "Start nginx? (y/n): " start_nginx_choice
+            if [[ "$start_nginx_choice" == "y" ]]; then
+                if start_nginx; then
+                    needs_restart=true
+                fi
+            fi
+        else
+            echo -e "${RED}nginx is not installed${NC}"
+            read -p "Install nginx now? (y/n): " install_nginx_choice
+            if [[ "$install_nginx_choice" == "y" ]]; then
+                install_nginx
+                needs_restart=true
+            fi
+        fi
+    else
+        echo -e "${GREEN}nginx is already running${NC}"
+    fi
+
+    echo ""
+
+    # Check n8n if Docker is running
+    if check_docker; then
+        if docker ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^n8n$"; then
+            if ! docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^n8n$"; then
+                echo -e "${YELLOW}n8n container exists but is not running${NC}"
+                read -p "Start n8n container? (y/n): " start_n8n_choice
+                if [[ "$start_n8n_choice" == "y" ]]; then
+                    docker start n8n && log_success "n8n container started"
+                fi
+            else
+                echo -e "${GREEN}n8n is already running${NC}"
+            fi
+        fi
+    fi
+
+    echo ""
+    if [[ "$needs_restart" == "true" ]]; then
+        log_success "Services have been started"
+    fi
+}
+
 # System status overview
 system_status() {
     echo "=== System Status Overview ==="
@@ -1271,25 +1438,26 @@ menu() {
         echo "  2)  Install Docker Only"
         echo "  3)  Install nginx Only"
         echo "  4)  Reinstall n8n"
+        echo "  5)  Start/Enable Services"
         echo ""
         echo "  === Configuration ==="
-        echo "  5)  Add Custom Route"
-        echo "  6)  List Routes & Status"
-        echo "  7)  Remove Route"
-        echo "  8)  Change Settings"
-        echo "  9)  Refresh All Configs"
+        echo "  6)  Add Custom Route"
+        echo "  7)  List Routes & Status"
+        echo "  8)  Remove Route"
+        echo "  9)  Change Settings"
+        echo "  10) Refresh All Configs"
         echo ""
         echo "  === Docker Management ==="
-        echo "  10) Docker Status & Info"
-        echo "  11) List All Containers"
-        echo "  12) Manage n8n Container"
-        echo "  13) Remove n8n Volumes"
-        echo "  14) Docker Cleanup"
+        echo "  11) Docker Status & Info"
+        echo "  12) List All Containers"
+        echo "  13) Manage n8n Container"
+        echo "  14) Remove n8n Volumes"
+        echo "  15) Docker Cleanup"
         echo ""
         echo "  === System ==="
-        echo "  15) System Status"
-        echo "  16) Update Script"
-        echo "  17) Exit"
+        echo "  16) System Status"
+        echo "  17) Update Script"
+        echo "  18) Exit"
         echo ""
         read -p "Select option: " choice
 
@@ -1298,19 +1466,20 @@ menu() {
             2) install_docker; read -p "Press enter to continue... " ;;
             3) install_nginx; read -p "Press enter to continue... " ;;
             4) reinstall_n8n; read -p "Press enter to continue... " ;;
-            5) add_route; read -p "Press enter to continue... " ;;
-            6) list_routes; read -p "Press enter to continue... " ;;
-            7) remove_route; read -p "Press enter to continue... " ;;
-            8) change_settings; read -p "Press enter to continue... " ;;
-            9) refresh_config; read -p "Press enter to continue... " ;;
-            10) docker_status; read -p "Press enter to continue... " ;;
-            11) list_containers; read -p "Press enter to continue... " ;;
-            12) manage_n8n_container; read -p "Press enter to continue... " ;;
-            13) remove_n8n_volumes; read -p "Press enter to continue... " ;;
-            14) docker_cleanup; read -p "Press enter to continue... " ;;
-            15) system_status; read -p "Press enter to continue... " ;;
-            16) update_script ;;
-            17) log_info "Goodbye!"; exit 0 ;;
+            5) start_services; read -p "Press enter to continue... " ;;
+            6) add_route; read -p "Press enter to continue... " ;;
+            7) list_routes; read -p "Press enter to continue... " ;;
+            8) remove_route; read -p "Press enter to continue... " ;;
+            9) change_settings; read -p "Press enter to continue... " ;;
+            10) refresh_config; read -p "Press enter to continue... " ;;
+            11) docker_status; read -p "Press enter to continue... " ;;
+            12) list_containers; read -p "Press enter to continue... " ;;
+            13) manage_n8n_container; read -p "Press enter to continue... " ;;
+            14) remove_n8n_volumes; read -p "Press enter to continue... " ;;
+            15) docker_cleanup; read -p "Press enter to continue... " ;;
+            16) system_status; read -p "Press enter to continue... " ;;
+            17) update_script ;;
+            18) log_info "Goodbye!"; exit 0 ;;
             *) log_error "Invalid option"; sleep 1 ;;
         esac
     done
@@ -1351,6 +1520,10 @@ case "${1:-}" in
         load_config
         docker_status
         ;;
+    "-start-services"|"start-services")
+        load_config
+        start_services
+        ;;
     "-help"|"help"|"-h")
         echo "N8S Manager - nginx + Docker + n8n Super Script"
         echo ""
@@ -1360,6 +1533,7 @@ case "${1:-}" in
         echo "  -install-docker        Install Docker only"
         echo "  -install-nginx         Install nginx only"
         echo "  -install-n8n           Install n8n with full setup"
+        echo "  -start-services        Start/enable Docker, nginx, and n8n services"
         echo ""
         echo "Status & Information:"
         echo "  status, -status        Show system status overview"
