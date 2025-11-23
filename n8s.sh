@@ -861,7 +861,7 @@ version: '3.8'
 
 services:
   n8n:
-    image: docker.io/n8nio/n8n:1.120.4
+    image: docker.io/n8nio/n8n:1.190.1
     container_name: n8n
     restart: unless-stopped
     network_mode: host
@@ -892,7 +892,7 @@ version: '3.8'
 
 services:
   n8n:
-    image: docker.io/n8nio/n8n:1.120.4
+    image: docker.io/n8nio/n8n:1.190.1
     container_name: n8n
     restart: unless-stopped
     ports:
