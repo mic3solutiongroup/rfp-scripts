@@ -80,6 +80,32 @@ load_config() {
     : "${N8N_INSTALLED:=false}"
     : "${DOCKER_INSTALLED:=false}"
     : "${NGINX_INSTALLED:=false}"
+
+    # Verify actual system state (override config if needed)
+    if check_docker; then
+        if [[ "$DOCKER_INSTALLED" != "true" ]]; then
+            log_info "Docker detected on system (updating config)"
+            DOCKER_INSTALLED=true
+            save_config
+        fi
+    fi
+
+    if command -v nginx &> /dev/null; then
+        if [[ "$NGINX_INSTALLED" != "true" ]]; then
+            log_info "nginx detected on system (updating config)"
+            NGINX_INSTALLED=true
+            save_config
+        fi
+    fi
+
+    # Check if n8n container exists
+    if check_docker && docker ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^n8n$"; then
+        if [[ "$N8N_INSTALLED" != "true" ]]; then
+            log_info "n8n container detected on system (updating config)"
+            N8N_INSTALLED=true
+            save_config
+        fi
+    fi
 }
 
 # Save configuration
@@ -212,34 +238,74 @@ install_docker() {
     fi
 }
 
+# Check nginx status
+check_nginx() {
+    # Check if nginx command exists
+    if ! command -v nginx &> /dev/null; then
+        return 1
+    fi
+
+    # Check if nginx is running (process or service)
+    if pgrep -x nginx > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        return 0
+    fi
+
+    # nginx exists but not running
+    return 1
+}
+
 # Check Docker status
 check_docker() {
     if ! command -v docker &> /dev/null; then
         return 1
     fi
 
-    if ! systemctl is-active --quiet docker 2>/dev/null; then
-        if ! systemctl start docker 2>/dev/null; then
-            return 1
+    # Check if Docker is running via systemctl
+    if systemctl is-active --quiet docker 2>/dev/null; then
+        # Test Docker functionality
+        if docker info &> /dev/null; then
+            return 0
         fi
+    fi
+
+    # Try to start Docker if not running
+    if systemctl start docker 2>/dev/null; then
         sleep 2
+        if docker info &> /dev/null; then
+            return 0
+        fi
     fi
 
-    # Test Docker functionality
-    if ! docker info &> /dev/null; then
-        return 1
+    # Check if Docker daemon is running (even without systemd)
+    if docker info &> /dev/null; then
+        return 0
     fi
 
-    return 0
+    return 1
 }
 
 # Install and configure nginx
 install_nginx() {
     log_info "Starting nginx installation..."
-    
+
+    # Check if nginx is already installed
     if command -v nginx &> /dev/null; then
         log_success "nginx is already installed"
         NGINX_INSTALLED=true
+
+        # Ensure nginx is running
+        if ! check_nginx; then
+            log_info "nginx is installed but not running. Starting nginx service..."
+            if ! systemctl start nginx 2>/dev/null; then
+                log_warning "Could not start nginx via systemctl. It may be managed by a control panel."
+            fi
+        else
+            log_success "nginx is running"
+        fi
     else
         log_info "Installing nginx..."
         if ! apt update || ! apt install -y nginx; then
@@ -247,15 +313,11 @@ install_nginx() {
             return 1
         fi
         NGINX_INSTALLED=true
-        systemctl enable nginx
-    fi
+        systemctl enable nginx 2>/dev/null || true
 
-    # Ensure nginx is running
-    if ! systemctl is-active --quiet nginx; then
-        log_info "Starting nginx service..."
-        if ! systemctl start nginx; then
-            log_error "Failed to start nginx"
-            return 1
+        # Start nginx
+        if ! systemctl start nginx 2>/dev/null; then
+            log_warning "Could not start nginx via systemctl"
         fi
     fi
 
@@ -1128,26 +1190,36 @@ manage_n8n_container() {
 # System status overview
 system_status() {
     echo "=== System Status Overview ==="
-    
+
     # Docker status
     if check_docker; then
         echo -e "Docker: ${GREEN}✓ Running${NC}"
     else
-        echo -e "Docker: ${RED}✗ Not Running${NC}"
+        if command -v docker &> /dev/null; then
+            echo -e "Docker: ${YELLOW}⚠ Installed but not running${NC}"
+        else
+            echo -e "Docker: ${RED}✗ Not Installed${NC}"
+        fi
     fi
-    
+
     # nginx status
-    if systemctl is-active --quiet nginx; then
+    if check_nginx; then
         echo -e "nginx:  ${GREEN}✓ Running${NC}"
     else
-        echo -e "nginx:  ${RED}✗ Not Running${NC}"
+        if command -v nginx &> /dev/null; then
+            echo -e "nginx:  ${YELLOW}⚠ Installed but not running${NC}"
+        else
+            echo -e "nginx:  ${RED}✗ Not Installed${NC}"
+        fi
     fi
-    
+
     # n8n status
-    if docker ps --format "table {{.Names}}" | grep -q n8n; then
+    if check_docker && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^n8n$"; then
         echo -e "n8n:    ${GREEN}✓ Running${NC}"
+    elif check_docker && docker ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^n8n$"; then
+        echo -e "n8n:    ${YELLOW}⚠ Container exists but not running${NC}"
     elif [[ "$N8N_INSTALLED" == "true" ]]; then
-        echo -e "n8n:    ${YELLOW}⚠ Installed but not running${NC}"
+        echo -e "n8n:    ${YELLOW}⚠ Marked as installed${NC}"
     else
         echo -e "n8n:    ${RED}✗ Not Installed${NC}"
     fi
