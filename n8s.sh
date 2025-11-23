@@ -17,6 +17,7 @@ SERVER_IP_DEFAULT="localhost"
 
 # Global variables
 declare -gA PORT_MAPPINGS || true
+INTERACTIVE_MODE=true
 
 # Color codes for output
 RED='\033[0;31m'
@@ -46,29 +47,57 @@ load_config() {
         log_info "Loading existing configuration from $CONFIG_FILE"
         source "$CONFIG_FILE"
     else
-        log_info "No existing config found. Setting up initial configuration..."
-        
-        # Get external IP with fallback
-        if SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 ipinfo.io/ip || echo "$SERVER_IP_DEFAULT"); then
-            log_info "Detected server IP: $SERVER_IP"
+        # Check if running interactively
+        if [[ "$INTERACTIVE_MODE" == "true" ]]; then
+            log_info "No existing config found. Setting up initial configuration..."
+
+            # Get external IP with fallback
+            if SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 ipinfo.io/ip || echo "$SERVER_IP_DEFAULT"); then
+                log_info "Detected server IP: $SERVER_IP"
+            else
+                SERVER_IP="$SERVER_IP_DEFAULT"
+                log_warning "Could not detect external IP, using: $SERVER_IP"
+            fi
+
+            read -p "Enter nginx port to listen on [${NGINX_PORT_DEFAULT}]: " input_port
+            NGINX_PORT="${input_port:-$NGINX_PORT_DEFAULT}"
+
+            read -p "Enter n8n directory [${N8N_DIR}]: " input_dir
+            N8N_DIR="${input_dir:-$N8N_DIR}"
+
+            # Initialize other variables
+            N8N_INSTALLED=false
+            DOCKER_INSTALLED=false
+            NGINX_INSTALLED=false
+            # PORT_MAPPINGS is already declared globally, just clear it
+            PORT_MAPPINGS=()
+
+            save_config
         else
-            SERVER_IP="$SERVER_IP_DEFAULT"
-            log_warning "Could not detect external IP, using: $SERVER_IP"
+            # Non-interactive mode - use defaults
+            log_info "No config found. Using default values..."
+
+            # Get external IP with fallback
+            if SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 ipinfo.io/ip 2>/dev/null); then
+                log_info "Detected server IP: $SERVER_IP"
+            else
+                SERVER_IP="$SERVER_IP_DEFAULT"
+                log_info "Using default IP: $SERVER_IP"
+            fi
+
+            NGINX_PORT="$NGINX_PORT_DEFAULT"
+            N8N_DIR="$N8N_DIR"
+            N8N_INSTALLED=false
+            DOCKER_INSTALLED=false
+            NGINX_INSTALLED=false
+            # PORT_MAPPINGS is already declared globally, just clear it
+            PORT_MAPPINGS=()
+
+            log_info "Using nginx port: $NGINX_PORT"
+            log_info "Using n8n directory: $N8N_DIR"
+
+            save_config
         fi
-
-        read -p "Enter nginx port to listen on [${NGINX_PORT_DEFAULT}]: " input_port
-        NGINX_PORT="${input_port:-$NGINX_PORT_DEFAULT}"
-
-        read -p "Enter n8n directory [${N8N_DIR}]: " input_dir
-        N8N_DIR="${input_dir:-$N8N_DIR}"
-
-        # Initialize other variables
-        N8N_INSTALLED=false
-        DOCKER_INSTALLED=false
-        NGINX_INSTALLED=false
-        declare -gA PORT_MAPPINGS
-
-        save_config
     fi
 
     # Set defaults if not defined
@@ -121,7 +150,8 @@ save_config() {
         echo "N8N_DIR='$N8N_DIR'"
         echo "ROUTES_DIR='$ROUTES_DIR'"
         echo "NGINX_CONF='$NGINX_CONF'"
-        if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        # Always initialize PORT_MAPPINGS as associative array
+        if [[ "${!PORT_MAPPINGS[@]+isset}" == "isset" ]] && [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
             echo "declare -gA PORT_MAPPINGS=("
             for key in "${!PORT_MAPPINGS[@]}"; do
                 echo "  ['$key']='${PORT_MAPPINGS[$key]}'"
@@ -1488,39 +1518,49 @@ menu() {
 # Handle command line arguments
 case "${1:-}" in
     "-update"|"update")
+        INTERACTIVE_MODE=false
         update_script
         ;;
     "-status"|"status")
+        INTERACTIVE_MODE=false
         load_config
         system_status
         ;;
     "-install-docker")
+        INTERACTIVE_MODE=false
         install_docker
         ;;
     "-install-nginx")
+        INTERACTIVE_MODE=false
         install_nginx
         ;;
     "-install-n8n")
+        INTERACTIVE_MODE=false
         load_config
         install_n8n
         ;;
     "-list-containers")
+        INTERACTIVE_MODE=false
         load_config
         list_containers
         ;;
     "-manage-n8n")
+        INTERACTIVE_MODE=false
         load_config
         manage_n8n_container
         ;;
     "-docker-cleanup")
+        INTERACTIVE_MODE=false
         load_config
         docker_cleanup
         ;;
     "-docker-status")
+        INTERACTIVE_MODE=false
         load_config
         docker_status
         ;;
     "-start-services"|"start-services")
+        INTERACTIVE_MODE=false
         load_config
         start_services
         ;;
