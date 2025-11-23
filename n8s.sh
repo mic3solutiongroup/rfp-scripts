@@ -69,7 +69,8 @@ load_config() {
             N8N_INSTALLED=false
             DOCKER_INSTALLED=false
             NGINX_INSTALLED=false
-            declare -gA PORT_MAPPINGS
+            # PORT_MAPPINGS is already declared globally, just clear it
+            PORT_MAPPINGS=()
 
             save_config
         else
@@ -89,7 +90,8 @@ load_config() {
             N8N_INSTALLED=false
             DOCKER_INSTALLED=false
             NGINX_INSTALLED=false
-            declare -gA PORT_MAPPINGS
+            # PORT_MAPPINGS is already declared globally, just clear it
+            PORT_MAPPINGS=()
 
             log_info "Using nginx port: $NGINX_PORT"
             log_info "Using n8n directory: $N8N_DIR"
@@ -148,7 +150,8 @@ save_config() {
         echo "N8N_DIR='$N8N_DIR'"
         echo "ROUTES_DIR='$ROUTES_DIR'"
         echo "NGINX_CONF='$NGINX_CONF'"
-        if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        # Always initialize PORT_MAPPINGS as associative array
+        if [[ "${!PORT_MAPPINGS[@]+isset}" == "isset" ]] && [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
             echo "declare -gA PORT_MAPPINGS=("
             for key in "${!PORT_MAPPINGS[@]}"; do
                 echo "  ['$key']='${PORT_MAPPINGS[$key]}'"
