@@ -112,7 +112,7 @@ load_config() {
     : "${NGINX_INSTALLED:=false}"
 
     # Initialize NGINX_PORTS if not set
-    if [[ "${#NGINX_PORTS[@]}" -eq 0 ]]; then
+    if [[ -z "${NGINX_PORTS+x}" ]] || [[ "${#NGINX_PORTS[@]}" -eq 0 ]]; then
         NGINX_PORTS=("$NGINX_PORT")
     fi
 
