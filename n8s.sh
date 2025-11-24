@@ -17,6 +17,7 @@ SERVER_IP_DEFAULT="localhost"
 
 # Global variables
 declare -gA PORT_MAPPINGS || true
+declare -ga NGINX_PORTS || true
 INTERACTIVE_MODE=true
 
 # Color codes for output
@@ -110,6 +111,16 @@ load_config() {
     : "${DOCKER_INSTALLED:=false}"
     : "${NGINX_INSTALLED:=false}"
 
+    # Initialize NGINX_PORTS if not set
+    if [[ "${#NGINX_PORTS[@]}" -eq 0 ]]; then
+        NGINX_PORTS=("$NGINX_PORT")
+    fi
+
+    # Ensure main NGINX_PORT is in NGINX_PORTS
+    if [[ ! " ${NGINX_PORTS[@]} " =~ " ${NGINX_PORT} " ]]; then
+        NGINX_PORTS+=("$NGINX_PORT")
+    fi
+
     # Verify actual system state (override config if needed)
     if check_docker; then
         if [[ "$DOCKER_INSTALLED" != "true" ]]; then
@@ -150,6 +161,18 @@ save_config() {
         echo "N8N_DIR='$N8N_DIR'"
         echo "ROUTES_DIR='$ROUTES_DIR'"
         echo "NGINX_CONF='$NGINX_CONF'"
+
+        # Save NGINX_PORTS array
+        if [[ "${#NGINX_PORTS[@]}" -gt 0 ]]; then
+            echo "NGINX_PORTS=("
+            for nginx_port in "${NGINX_PORTS[@]}"; do
+                echo "  $nginx_port"
+            done
+            echo ")"
+        else
+            echo "NGINX_PORTS=()"
+        fi
+
         # Always initialize PORT_MAPPINGS as associative array
         if [[ "${!PORT_MAPPINGS[@]+isset}" == "isset" ]] && [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
             echo "declare -gA PORT_MAPPINGS=("
@@ -633,8 +656,8 @@ reinstall_nginx() {
 
 # Generate nginx configuration
 generate_nginx_config() {
-    log_info "Generating nginx configuration..."
-    
+    log_info "Generating nginx configuration for ${#NGINX_PORTS[@]} port(s)..."
+
     mkdir -p "$ROUTES_DIR"
 
     # Remove old conflicting configurations
@@ -642,11 +665,13 @@ generate_nginx_config() {
     rm -f /etc/nginx/sites-enabled/8443-router.conf 2>/dev/null || true
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-    # Create main nginx configuration
-    cat > "$NGINX_CONF" << 'NGXEOF'
+    # Create nginx configuration with server blocks for each port
+    {
+        for nginx_port in "${NGINX_PORTS[@]}"; do
+            cat << NGXEOF
 server {
-    listen NGINX_PORT_PLACEHOLDER default_server;
-    listen [::]:NGINX_PORT_PLACEHOLDER default_server;
+    listen ${nginx_port} $([ "$nginx_port" == "${NGINX_PORTS[0]}" ] && echo "default_server" || echo "");
+    listen [::]:${nginx_port} $([ "$nginx_port" == "${NGINX_PORTS[0]}" ] && echo "default_server" || echo "");
     server_name _;
     client_max_body_size 100M;
 
@@ -658,28 +683,28 @@ server {
 
     # Root endpoint
     location = / {
-        return 200 'n8s router is running on port NGINX_PORT_PLACEHOLDER\n';
+        return 200 'n8s router is running on port ${nginx_port}\n';
         add_header Content-Type text/plain;
     }
 
-    # Include all route configurations
-    include ROUTES_DIR_PLACEHOLDER/*.conf;
+    # Include route configurations for this port
+    include ${ROUTES_DIR}/${nginx_port}-*.conf;
 }
-NGXEOF
 
-    # Replace placeholders
-    sed -i "s/NGINX_PORT_PLACEHOLDER/$NGINX_PORT/g" "$NGINX_CONF"
-    sed -i "s|ROUTES_DIR_PLACEHOLDER|$ROUTES_DIR|g" "$NGINX_CONF"
+NGXEOF
+        done
+    } > "$NGINX_CONF"
 
     # Enable site
     ln -sf "$NGINX_CONF" "$NGINX_CONF_ENABLED"
 
     # Test and reload nginx
-    if nginx -t; then
-        systemctl reload nginx
-        log_success "nginx configuration updated successfully"
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null || true
+        log_success "nginx configuration updated successfully for ports: ${NGINX_PORTS[*]}"
     else
         log_error "nginx configuration test failed"
+        nginx -t
         return 1
     fi
 }
@@ -731,7 +756,7 @@ location / {
 }
 N8NEOF
 
-        PORT_MAPPINGS["/"]="$n8n_internal_port"
+        PORT_MAPPINGS["${NGINX_PORT}:/"]="$n8n_internal_port"
         N8N_BASE_PATH="/"
         log_success "Direct access configured: http://${SERVER_IP}:${NGINX_PORT}/ -> http://127.0.0.1:${n8n_internal_port}/"
 
@@ -746,8 +771,8 @@ N8NEOF
 
         log_info "Configuring path-based access (subpath: ${n8n_path})..."
 
-        # Create nginx config for subpath
-        cat > "$ROUTES_DIR/n8n.conf" << N8NEOF
+        # Create nginx config for subpath with port-specific filename
+        cat > "$ROUTES_DIR/${NGINX_PORT}-n8n.conf" << N8NEOF
 location ${n8n_path} {
     proxy_pass http://127.0.0.1:${n8n_internal_port}/;
     proxy_http_version 1.1;
@@ -771,7 +796,7 @@ location = ${n8n_path%/} {
 }
 N8NEOF
 
-        PORT_MAPPINGS["$n8n_path"]="$n8n_internal_port"
+        PORT_MAPPINGS["${NGINX_PORT}:$n8n_path"]="$n8n_internal_port"
         N8N_BASE_PATH="$n8n_path"
         log_success "Path-based access configured: http://${SERVER_IP}:${NGINX_PORT}${n8n_path} -> http://127.0.0.1:${n8n_internal_port}/"
     fi
@@ -952,7 +977,7 @@ DCEOF
 
     if [[ "$access_type" == "1" ]]; then
         # Direct Access - Root Path
-        cat > "$ROUTES_DIR/n8n.conf" << 'N8NEOF'
+        cat > "$ROUTES_DIR/${NGINX_PORT}-n8n.conf" << 'N8NEOF'
 location / {
     proxy_pass http://127.0.0.1:5678/;
     proxy_http_version 1.1;
@@ -971,10 +996,10 @@ location / {
     proxy_connect_timeout 75s;
 }
 N8NEOF
-        PORT_MAPPINGS["/"]="5678"
+        PORT_MAPPINGS["${NGINX_PORT}:/"]="5678"
     else
         # Path-Based Access - Subpath
-        cat > "$ROUTES_DIR/n8n.conf" << N8NEOF
+        cat > "$ROUTES_DIR/${NGINX_PORT}-n8n.conf" << N8NEOF
 location ${N8N_BASE_PATH} {
     proxy_pass http://127.0.0.1:5678/;
     proxy_http_version 1.1;
@@ -997,7 +1022,7 @@ location = ${N8N_BASE_PATH%/} {
     return 301 ${N8N_BASE_PATH};
 }
 N8NEOF
-        PORT_MAPPINGS["$N8N_BASE_PATH"]="5678"
+        PORT_MAPPINGS["${NGINX_PORT}:$N8N_BASE_PATH"]="5678"
     fi
 
     # Reload nginx
@@ -1074,6 +1099,38 @@ reinstall_n8n() {
 
 # Add custom route
 add_route() {
+    # Show available nginx ports
+    echo "=== Available nginx ports ==="
+    for i in "${!NGINX_PORTS[@]}"; do
+        echo "$((i+1))) Port ${NGINX_PORTS[$i]}"
+    done
+    echo "$((${#NGINX_PORTS[@]}+1))) Add a new port"
+    echo ""
+
+    read -p "Select nginx port [1]: " port_choice
+    port_choice="${port_choice:-1}"
+
+    local nginx_port
+    if [[ "$port_choice" == "$((${#NGINX_PORTS[@]}+1))" ]]; then
+        # Add new port
+        read -p "Enter new nginx port: " nginx_port
+        if [[ ! "$nginx_port" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid port number"
+            return 1
+        fi
+        NGINX_PORTS+=("$nginx_port")
+        save_config
+        log_success "Added nginx port: $nginx_port"
+        generate_nginx_config
+    else
+        # Use existing port
+        if [[ "$port_choice" -lt 1 || "$port_choice" -gt "${#NGINX_PORTS[@]}" ]]; then
+            log_error "Invalid selection"
+            return 1
+        fi
+        nginx_port="${NGINX_PORTS[$((port_choice-1))]}"
+    fi
+
     read -p "Enter nginx path (e.g., /api/): " path
     read -p "Enter internal port: " port
     read -p "Route name (alphanumeric): " name
@@ -1092,8 +1149,8 @@ add_route() {
 
     mkdir -p "$ROUTES_DIR"
 
-    # Create route configuration
-    cat > "$ROUTES_DIR/${name}.conf" << RTEOF
+    # Create route configuration with port-specific filename
+    cat > "$ROUTES_DIR/${nginx_port}-${name}.conf" << RTEOF
 location $path {
     proxy_pass http://127.0.0.1:$port/;
     proxy_http_version 1.1;
@@ -1109,11 +1166,11 @@ RTEOF
 
     # Test and reload nginx
     if nginx -t && systemctl reload nginx; then
-        PORT_MAPPINGS["$path"]="$port"
+        PORT_MAPPINGS["$nginx_port:$path"]="$port"
         save_config
-        log_success "Route added: http://$SERVER_IP:$NGINX_PORT$path -> localhost:$port"
+        log_success "Route added: http://$SERVER_IP:$nginx_port$path -> localhost:$port"
     else
-        rm -f "$ROUTES_DIR/${name}.conf"
+        rm -f "$ROUTES_DIR/${nginx_port}-${name}.conf"
         log_error "Failed to add route - nginx configuration test failed"
         return 1
     fi
@@ -1122,7 +1179,8 @@ RTEOF
 # List all routes
 list_routes() {
     echo "=== Current Configuration ==="
-    echo "Nginx Port    : $NGINX_PORT"
+    echo "Primary Port  : $NGINX_PORT"
+    echo "Active Ports  : ${NGINX_PORTS[*]}"
     echo "Server IP     : $SERVER_IP"
     echo "Docker Status : $([ "$DOCKER_INSTALLED" = "true" ] && echo "Installed" || echo "Not Installed")"
     echo "nginx Status  : $([ "$NGINX_INSTALLED" = "true" ] && echo "Installed" || echo "Not Installed")"
@@ -1130,13 +1188,28 @@ list_routes() {
     echo "n8n Directory : $N8N_DIR"
     echo "Routes Dir    : $ROUTES_DIR"
     echo ""
-    
+
     if [[ ${#PORT_MAPPINGS[@]} -eq 0 ]]; then
         echo "No routes configured"
     else
         echo "=== Configured Routes ==="
-        for path in "${!PORT_MAPPINGS[@]}"; do
-            echo "http://$SERVER_IP:$NGINX_PORT$path -> localhost:${PORT_MAPPINGS[$path]}"
+        # Group routes by nginx port
+        for nginx_port in "${NGINX_PORTS[@]}"; do
+            local has_routes=false
+            echo ""
+            echo "Port $nginx_port:"
+            for key in "${!PORT_MAPPINGS[@]}"; do
+                # Check if this mapping is for the current nginx port
+                if [[ "$key" =~ ^${nginx_port}: ]]; then
+                    local path="${key#*:}"
+                    local internal_port="${PORT_MAPPINGS[$key]}"
+                    echo "  http://$SERVER_IP:$nginx_port$path -> localhost:$internal_port"
+                    has_routes=true
+                fi
+            done
+            if [[ "$has_routes" == "false" ]]; then
+                echo "  (no routes configured)"
+            fi
         done
     fi
 }
