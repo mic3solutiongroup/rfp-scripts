@@ -748,6 +748,7 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Origin "$scheme://$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -784,6 +785,7 @@ location ${n8n_path} {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-Port \$server_port;
+    proxy_set_header Origin "\$scheme://\$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -989,6 +991,7 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Origin "$scheme://$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -1011,6 +1014,7 @@ location ${N8N_BASE_PATH} {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-Port \$server_port;
+    proxy_set_header Origin "\$scheme://\$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
