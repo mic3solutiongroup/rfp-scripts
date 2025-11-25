@@ -681,12 +681,6 @@ server {
         add_header Content-Type text/plain;
     }
 
-    # Root endpoint
-    location = / {
-        return 200 'n8s router is running on port ${nginx_port}\n';
-        add_header Content-Type text/plain;
-    }
-
     # Include route configurations for this port
     include ${ROUTES_DIR}/${nginx_port}-*.conf;
 }
