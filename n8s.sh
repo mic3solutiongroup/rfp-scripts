@@ -681,12 +681,6 @@ server {
         add_header Content-Type text/plain;
     }
 
-    # Root endpoint
-    location = / {
-        return 200 'n8s router is running on port ${nginx_port}\n';
-        add_header Content-Type text/plain;
-    }
-
     # Include route configurations for this port
     include ${ROUTES_DIR}/${nginx_port}-*.conf;
 }
@@ -748,6 +742,7 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Origin "$scheme://$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -784,6 +779,7 @@ location ${n8n_path} {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-Port \$server_port;
+    proxy_set_header Origin "\$scheme://\$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -904,6 +900,8 @@ services:
       - GENERIC_TIMEZONE=UTC
     volumes:
       - n8n_data:/home/node/.n8n
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   n8n_data:
@@ -937,15 +935,20 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
-      - n8n_network
+      - kb_default
+      - rfp_default
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   n8n_data:
     external: true
 
 networks:
-  n8n_network:
-    driver: bridge
+  kb_default:
+    external: true
+  rfp_default:
+    external: true
 DCEOF
     fi
 
@@ -989,6 +992,7 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Origin "$scheme://$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
@@ -1011,6 +1015,7 @@ location ${N8N_BASE_PATH} {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-Port \$server_port;
+    proxy_set_header Origin "\$scheme://\$host";
 
     proxy_buffering off;
     proxy_request_buffering off;
