@@ -906,6 +906,8 @@ services:
       - GENERIC_TIMEZONE=UTC
     volumes:
       - n8n_data:/home/node/.n8n
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   n8n_data:
@@ -939,15 +941,20 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
-      - n8n_network
+      - kb_default
+      - rfp_default
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   n8n_data:
     external: true
 
 networks:
-  n8n_network:
-    driver: bridge
+  kb_default:
+    external: true
+  rfp_default:
+    external: true
 DCEOF
     fi
 
